@@ -1,0 +1,48 @@
+[project]
+name = "foundation-platform-sdk"
+version = "0.7.0"
+description = "Python SDK for the Foundation Platform API"
+requires-python = ">=3.12"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Sergey Kovalev", email = "sergey.kovalev@treefrogconsulting.com"}
+]
+keywords = ["foundation", "platform", "api", "sdk", "insurance", "reinsurance"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+    "requests>=2.31.0",
+    "pandas>=2.2.2",
+    "polars>=0.20.0",
+    "duckdb>=1.0.0",
+    "pyarrow>=22.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+
+]
+
+[project.urls]
+Homepage = "https://www.foundationplatform.com"
+Documentation = "https://docs.foundationplatform.com/"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["foundation"]
+
+[dependency-groups]
+dev = [
+
+]
