@@ -3,16 +3,20 @@
 A Python SDK for interacting with the Foundation Platform API.
 """
 
+from .exceptions import LossGroupAttachError, LossSetValidationError
 from .models import (
     FoundationClient,
     Layer,
+    LossGroup,
+    LossGroupUploadResult,
+    LossSetResult,
     Program,
     ReferenceRun,
     ReferenceRuns,
     RunConfiguration,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 __all__ = [
     "FoundationClient",
     "Program",
@@ -20,6 +24,11 @@ __all__ = [
     "ReferenceRun",
     "ReferenceRuns",
     "RunConfiguration",
+    "LossSetValidationError",
+    "LossGroupAttachError",
+    "LossGroup",
+    "LossSetResult",
+    "LossGroupUploadResult",
 ]
 
 

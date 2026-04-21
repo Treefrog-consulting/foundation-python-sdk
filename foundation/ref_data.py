@@ -12,8 +12,12 @@ from .models.participant import Participant
 from .models.participant_status import ParticipantStatus
 from .models.client import Client
 from .models.reinst_prem_base import ReinstPremBase
+from .models.event_set import EventSet
 from .models.peril import Peril
+from .models.perspective import Perspective
 from .models.region import Region
+from .models.variant import Variant
+from .models.vendor import Vendor
 from .utils import parse_datetime_string
 
 
@@ -26,6 +30,7 @@ class ReferenceDataCache:
         clients_data: List[Dict[str, Any]],
         common_ref_data: Dict[str, Any],
         accessible_objects_data: Optional[Dict[str, Any]] = None,
+        loss_ref_data: Optional[Dict[str, Any]] = None,
     ):
         """
         Initialize the reference data cache.
@@ -35,10 +40,12 @@ class ReferenceDataCache:
             clients_data: Client data from /api/clients endpoint
             common_ref_data: Reference data from Common Module /api/ref endpoint
             accessible_objects_data: Accessible object definitions and values for lookup field resolution
+            loss_ref_data: Reference data from Loss Module /api/ref endpoint
         """
         self._deal_ref = deal_ref_data
         self._common_ref = common_ref_data
         self._clients = {client["id"]: client for client in clients_data}
+        self._clients_by_name = self._index_by_field(clients_data, "name")
 
         # Index Deal Module reference data by ID for a quick lookup
         self._brokers = self._index_values(
@@ -125,6 +132,35 @@ class ReferenceDataCache:
         self._reverse_lookup_maps: Dict[int, Dict[str, Any]] = {}
         self._accessible_objects: Dict[int, Dict[str, Any]] = {}
         self._build_lookup_maps(accessible_objects_data or {})
+
+        # Loss-module reference data (used by loss-set upload for
+        # string-name -> ID resolution). Index by id + name for O(1) lookup,
+        # matching the Peril / Region / Participant pattern.
+        loss_ref = loss_ref_data or {}
+        self._vendors = self._index_values(
+            loss_ref.get("vendor", {}).get("values", [])
+        )
+        self._vendors_by_name = self._index_by_field(
+            loss_ref.get("vendor", {}).get("values", []), "name"
+        )
+        self._variants = self._index_values(
+            loss_ref.get("variant", {}).get("values", [])
+        )
+        self._variants_by_name = self._index_by_field(
+            loss_ref.get("variant", {}).get("values", []), "name"
+        )
+        self._perspectives = self._index_values(
+            loss_ref.get("perspective", {}).get("values", [])
+        )
+        self._perspectives_by_name = self._index_by_field(
+            loss_ref.get("perspective", {}).get("values", []), "name"
+        )
+        self._event_sets = self._index_values(
+            loss_ref.get("eventSet", {}).get("values", [])
+        )
+        self._event_sets_by_name = self._index_by_field(
+            loss_ref.get("eventSet", {}).get("values", []), "name"
+        )
 
     @staticmethod
     def _build_model_ids_by_view_id(
@@ -305,10 +341,19 @@ class ReferenceDataCache:
                 result[key] = item
         return result
 
-    def get_client(self, client_id: int) -> Optional[Client]:
-        """Get a client by ID."""
-        data = self._clients.get(client_id)
+    def get_client(self, identifier: Union[int, str]) -> Optional[Client]:
+        """Get a client by ID or name (case-insensitive)."""
+        if isinstance(identifier, int):
+            data = self._clients.get(identifier)
+        elif isinstance(identifier, str):
+            data = self._clients_by_name.get(identifier.lower())
+        else:
+            return None
         return Client(data) if data else None
+
+    def get_all_clients(self) -> List[Client]:
+        """Get all clients."""
+        return [Client(data) for data in self._clients.values()]
 
     def get_broker(self, broker_id: int) -> Optional[Broker]:
         """Get broker by ID."""
@@ -404,9 +449,17 @@ class ReferenceDataCache:
         """Get category by ID."""
         return self._categories.get(category_id)
 
+    def get_all_categories(self) -> List[Dict[str, Any]]:
+        """Get all categories as raw dicts."""
+        return list(self._categories.values())
+
     def get_category_detail(self, detail_id: int) -> Optional[Dict[str, Any]]:
         """Get category detail by ID."""
         return self._category_details.get(detail_id)
+
+    def get_all_category_details(self) -> List[Dict[str, Any]]:
+        """Get all category details as raw dicts."""
+        return list(self._category_details.values())
 
     def get_external_ref_type(self, type_id: int) -> Optional[Dict[str, Any]]:
         """Get external ref type by ID."""
@@ -482,6 +535,53 @@ class ReferenceDataCache:
         """
         return [Region(data, self) for data in self._regions.values()]
 
+    def get_vendor(self, identifier: Union[int, str]) -> Optional[Vendor]:
+        """Get vendor by ID or name (case-insensitive)."""
+        return self._lookup_ref(identifier, self._vendors, self._vendors_by_name, Vendor)
+
+    def get_all_vendors(self) -> List[Vendor]:
+        """Get all vendors."""
+        return [Vendor(data) for data in self._vendors.values()]
+
+    def get_variant(self, identifier: Union[int, str]) -> Optional[Variant]:
+        """Get variant by ID or name (case-insensitive)."""
+        return self._lookup_ref(identifier, self._variants, self._variants_by_name, Variant)
+
+    def get_all_variants(self) -> List[Variant]:
+        """Get all variants."""
+        return [Variant(data) for data in self._variants.values()]
+
+    def get_perspective(self, identifier: Union[int, str]) -> Optional[Perspective]:
+        """Get perspective by ID or name (case-insensitive)."""
+        return self._lookup_ref(identifier, self._perspectives, self._perspectives_by_name, Perspective)
+
+    def get_all_perspectives(self) -> List[Perspective]:
+        """Get all perspectives."""
+        return [Perspective(data) for data in self._perspectives.values()]
+
+    def get_event_set(self, identifier: Union[int, str]) -> Optional[EventSet]:
+        """Get event set by ID or name (case-insensitive)."""
+        return self._lookup_ref(identifier, self._event_sets, self._event_sets_by_name, EventSet)
+
+    def get_all_event_sets(self) -> List[EventSet]:
+        """Get all event sets."""
+        return [EventSet(data) for data in self._event_sets.values()]
+
+    @staticmethod
+    def _lookup_ref(
+        identifier: Union[int, str],
+        by_id: Dict[int, Dict[str, Any]],
+        by_name: Dict[str, Dict[str, Any]],
+        model_cls: type,
+    ) -> Optional[Any]:
+        if isinstance(identifier, int):
+            data = by_id.get(identifier)
+        elif isinstance(identifier, str):
+            data = by_name.get(identifier.lower())
+        else:
+            return None
+        return model_cls(data) if data else None
+
     def build_custom_table_row(
         self, raw_row: Dict[str, Any], table_id: int
     ) -> Dict[str, Any]:
@@ -499,34 +599,28 @@ class ReferenceDataCache:
         Returns:
             Dictionary with actual column names as keys
         """
+        from .models._custom_table_fields import (
+            LOOKUP_VALUE_TYPE,
+            field_name_for_column,
+        )
+
         columns = self.get_custom_table_columns(table_id)
         result = {}
 
         for col in columns:
-            col_name = col["name"]
-            value_type = col["valueType"]
-            field_num = col["valueFieldNum"]
+            field_name = field_name_for_column(col)
+            if field_name is None:
+                continue
 
-            # Map valueType to field name
-            field_map = {
-                1: f"numValue{field_num}",  # Number
-                2: f"dateValue{field_num}",  # Date
-                3: f"bitValue{field_num}",  # Boolean
-                4: f"textValue{field_num}",  # Text
-                5: f"lookupValue{field_num}",  # Lookup
-            }
+            value = raw_row.get(field_name)
 
-            field_name = field_map.get(value_type)
-            if field_name:
-                value = raw_row.get(field_name)
+            # Resolve lookup fields to display labels
+            if col["valueType"] == LOOKUP_VALUE_TYPE and value is not None:
+                lookup_object_id = col.get("lookupObjectId")
+                if lookup_object_id is not None:
+                    value = self.resolve_lookup_value(lookup_object_id, value)
 
-                # Resolve lookup fields to display labels
-                if value_type == 5 and value is not None:
-                    lookup_object_id = col.get("lookupObjectId")
-                    if lookup_object_id is not None:
-                        value = self.resolve_lookup_value(lookup_object_id, value)
-
-                # Parse datetime strings automatically (same as custom fields)
-                result[col_name] = parse_datetime_string(value)
+            # Parse datetime strings automatically (same as custom fields)
+            result[col["name"]] = parse_datetime_string(value)
 
         return result

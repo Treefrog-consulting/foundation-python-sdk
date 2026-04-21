@@ -5,16 +5,22 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import requests
 
+from ..sys_config import SysConfigCache
 from ..utils import camel_to_snake
 
 if TYPE_CHECKING:
     from ..ref_data import ReferenceDataCache
+    from .client import Client
+    from .event_set import EventSet
     from .module_custom_table import ModuleCustomTable
     from .participant import Participant
     from .peril import Peril
+    from .perspective import Perspective
     from .program import Program
     from .reference_runs import ReferenceRuns
     from .region import Region
+    from .variant import Variant
+    from .vendor import Vendor
 
 
 class FoundationClient:
@@ -46,6 +52,28 @@ class FoundationClient:
             str, "ModuleCustomTable"
         ] = {}  # snake_name -> table
         self._reference_runs: Optional["ReferenceRuns"] = None
+        self._sys_config: Optional[SysConfigCache] = None
+        self._analyses_cache: Dict[int, List[Dict[str, Any]]] = {}
+
+    def _api_url(self, module: str, path: str) -> str:
+        """Build an absolute URL for the given Foundation module and path."""
+        return f"{self.base_url}:{self.PORTS[module]}/{path.lstrip('/')}"
+
+    def _fetch(self, module: str, path: str, *, method: str = "GET", **kwargs: Any) -> Any:
+        """Issue an authenticated JSON request and return the parsed response.
+
+        Args:
+            module: Module key in PORTS (e.g. 'deal', 'common', 'loss').
+            path: API path relative to the module root (e.g. '/api/ref').
+            method: HTTP method.
+            **kwargs: Forwarded to requests.Session.request (e.g. json=payload).
+
+        Raises:
+            requests.HTTPError: on non-2xx responses.
+        """
+        response = self._session.request(method, self._api_url(module, path), **kwargs)
+        response.raise_for_status()
+        return response.json()
 
     def authenticate(
         self, email: str, password: str, api_client_id: str, api_client_secret: str
@@ -62,20 +90,17 @@ class FoundationClient:
         Raises:
             requests.HTTPError: If authentication fails
         """
-        from ..ref_data import ReferenceDataCache
-
-        url = f"{self.base_url}:{self.PORTS['identity']}/api/account/login"
-        payload = {
-            "email": email,
-            "password": password,
-            "apiClientId": api_client_id,
-            "apiClientSecret": api_client_secret,
-        }
-
-        response = self._session.post(url, json=payload)
-        response.raise_for_status()
-
-        data = response.json()
+        data = self._fetch(
+            "identity",
+            "/api/account/login",
+            method="POST",
+            json={
+                "email": email,
+                "password": password,
+                "apiClientId": api_client_id,
+                "apiClientSecret": api_client_secret,
+            },
+        )
         self._token = data["tokenResponse"]["accessToken"]
         self._session.headers.update({"Authorization": f"Bearer {self._token}"})
 
@@ -84,42 +109,67 @@ class FoundationClient:
 
     def _load_reference_data(self) -> None:
         """Load and cache reference data from the API."""
+        from concurrent.futures import ThreadPoolExecutor
+
         from ..ref_data import ReferenceDataCache
         from .module_custom_table import ModuleCustomTable
+        from .reference_runs import ReferenceRuns
 
-        # Load Deal reference data
-        deal_ref_url = f"{self.base_url}:{self.PORTS['deal']}/api/ref"
-        deal_ref_response = self._session.get(deal_ref_url)
-        deal_ref_response.raise_for_status()
-        deal_ref_data = deal_ref_response.json()
+        # All seven calls are mutually independent — fetch in parallel to save
+        # ~6x RTT on authenticate(). Accessible-objects is a follow-on of
+        # deal_ref (needs its lookupObjectIds) and stays sequential below.
+        endpoints = {
+            "deal_ref": ("deal", "/api/ref"),
+            "clients": ("deal", "/api/clients"),
+            "common_ref": ("common", "/api/ref"),
+            "layer_headers": ("deal", "/api/layers/headers"),
+            "reference_runs": ("deal", "/api/referenceRuns"),
+            "loss_ref": ("loss", "/api/ref"),
+            "sys_configs": ("loss", "/api/SysConfigs"),
+        }
 
-        # Load clients data
-        clients_url = f"{self.base_url}:{self.PORTS['deal']}/api/clients"
-        clients_response = self._session.get(clients_url)
-        clients_response.raise_for_status()
-        clients_data = clients_response.json()
+        with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
+            futures = {
+                key: executor.submit(self._fetch, module, path)
+                for key, (module, path) in endpoints.items()
+            }
 
-        # Load Common reference data
-        common_ref_url = f"{self.base_url}:{self.PORTS['common']}/api/ref"
-        common_ref_response = self._session.get(common_ref_url)
-        common_ref_response.raise_for_status()
-        common_ref_data = common_ref_response.json()
+        def result_or_warn(key: str, warn_msg: str, default: Any) -> Any:
+            try:
+                return futures[key].result()
+            except Exception as exc:
+                warnings.warn(f"{warn_msg}: {exc}", stacklevel=3)
+                return default
 
-        # Load accessible objects for lookup field resolution in custom tables
-        accessible_objects_data = self._load_accessible_objects(deal_ref_data)
-
-        # Create reference data cache with all data
-        self._ref_cache = ReferenceDataCache(
-            deal_ref_data, clients_data, common_ref_data, accessible_objects_data
+        deal_ref_data = futures["deal_ref"].result()
+        clients_data = futures["clients"].result()
+        common_ref_data = futures["common_ref"].result()
+        layer_headers_data = futures["layer_headers"].result()
+        reference_runs_data = futures["reference_runs"].result()
+        loss_ref_data = result_or_warn(
+            "loss_ref",
+            "Failed to load Loss reference data from /api/ref. "
+            "Loss-set upload string-based lookups will not work",
+            default=None,
+        )
+        sys_configs_data = result_or_warn(
+            "sys_configs",
+            "Failed to load Loss SysConfig. "
+            "Loss-set upload will not function until SysConfig is reachable",
+            default=[],
         )
 
-        # Load layer headers for layer-to-program mapping
-        layer_headers_url = f"{self.base_url}:{self.PORTS['deal']}/api/layers/headers"
-        layer_headers_response = self._session.get(layer_headers_url)
-        layer_headers_response.raise_for_status()
-        layer_headers_data = layer_headers_response.json()
+        # Accessible objects depend on deal_ref's column definitions.
+        accessible_objects_data = self._load_accessible_objects(deal_ref_data)
 
-        # Build layer_id -> program_id mapping
+        self._ref_cache = ReferenceDataCache(
+            deal_ref_data,
+            clients_data,
+            common_ref_data,
+            accessible_objects_data,
+            loss_ref_data=loss_ref_data,
+        )
+
         self._layer_headers = {
             item["id"]: item["programId"] for item in layer_headers_data
         }
@@ -143,8 +193,8 @@ class FoundationClient:
                 )
                 self._module_custom_tables[snake_name] = table
 
-        # Load reference runs from Deal Module
-        self._load_reference_runs()
+        self._reference_runs = ReferenceRuns(reference_runs_data, self._ref_cache)
+        self._sys_config = SysConfigCache(sys_configs_data)
 
     def _load_accessible_objects(self, deal_ref_data: Dict[str, Any]) -> Dict[str, Any]:
         """Load accessible objects and their values for lookup field resolution.
@@ -164,27 +214,20 @@ class FoundationClient:
         """
         result: Dict[str, Any] = {"definitions": [], "values": []}
 
-        # Collect unique lookupObjectId values from custom table column definitions
         column_defs = deal_ref_data.get("customTableColumnDefinitions", {}).get(
             "values", []
         )
-        lookup_ids = set()
-        for col in column_defs:
-            lookup_id = col.get("lookupObjectId")
-            if lookup_id is not None:
-                lookup_ids.add(lookup_id)
-
+        lookup_ids = {
+            col["lookupObjectId"]
+            for col in column_defs
+            if col.get("lookupObjectId") is not None
+        }
         if not lookup_ids:
             return result
 
         # Fetch accessible object definitions from Common Module
         try:
-            ao_url = f"{self.base_url}:{self.PORTS['common']}/api/accessibleObjects"
-            ao_response = self._session.get(ao_url)
-            ao_response.raise_for_status()
-            all_accessible_objects = ao_response.json()
-
-            # Filter to only the ones we need
+            all_accessible_objects = self._fetch("common", "/api/accessibleObjects")
             result["definitions"] = [
                 ao for ao in all_accessible_objects if ao.get("id") in lookup_ids
             ]
@@ -197,12 +240,12 @@ class FoundationClient:
 
         # Fetch accessible object values via BulkSelection
         try:
-            bulk_url = f"{self.base_url}:{self.PORTS['common']}/api/accessibleObjects/BulkSelection"
-            bulk_response = self._session.post(
-                bulk_url, json={"accessibleObjectIds": sorted(lookup_ids)}
+            result["values"] = self._fetch(
+                "common",
+                "/api/accessibleObjects/BulkSelection",
+                method="POST",
+                json={"accessibleObjectIds": sorted(lookup_ids)},
             )
-            bulk_response.raise_for_status()
-            result["values"] = bulk_response.json()
         except Exception as exc:
             warnings.warn(
                 f"Failed to load accessible object values: {exc}",
@@ -210,21 +253,6 @@ class FoundationClient:
             )
 
         return result
-
-    def _load_reference_runs(self) -> None:
-        """Load and cache reference runs from the Deal Module.
-
-        Reference runs are loaded once and cached for the session.
-        Only active reference runs (activeFlag=True) are exposed.
-        """
-        from .reference_runs import ReferenceRuns
-
-        reference_runs_url = f"{self.base_url}:{self.PORTS['deal']}/api/referenceRuns"
-        reference_runs_response = self._session.get(reference_runs_url)
-        reference_runs_response.raise_for_status()
-        reference_runs_data = reference_runs_response.json()
-
-        self._reference_runs = ReferenceRuns(reference_runs_data, self._ref_cache)
 
     @property
     def reference_runs(self) -> "ReferenceRuns":
@@ -253,6 +281,21 @@ class FoundationClient:
         if self._reference_runs is None:
             return ReferenceRuns([])
         return self._reference_runs
+
+    @property
+    def sys_config(self) -> SysConfigCache:
+        """Get the Loss module SysConfig alias cache.
+
+        Returns:
+            SysConfigCache with the twelve YELTColAlias* / ELTColAliasList*
+            entries that define canonical loss-set upload column names.
+
+        Raises:
+            RuntimeError: If client is not authenticated.
+        """
+        if self._sys_config is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._sys_config
 
     def get_model_ids_by_view_id(self, model_view_id: int) -> List[int]:
         """Get list of model IDs for a given model view ID.
@@ -295,25 +338,19 @@ class FoundationClient:
         """
         from .program import Program
 
-        url = f"{self.base_url}:{self.PORTS['deal']}/api/programs/{program_id}"
-        response = self._session.get(url)
-        response.raise_for_status()
+        program_data = self._fetch("deal", f"/api/programs/{program_id}")
 
-        program_data = response.json()
+        # Fetch stored analyses from Metrics API (if available). Cache per
+        # program_id so repeated get_program() calls don't re-hit the endpoint.
+        if program_id not in self._analyses_cache:
+            try:
+                self._analyses_cache[program_id] = self._fetch(
+                    "deal", f"/api/analysesByProgram/{program_id}"
+                )
+            except Exception:
+                self._analyses_cache[program_id] = []
 
-        # Fetch stored analyses from Metrics API (if available)
-        analyses_data = []
-        try:
-            analyses_url = f"{self.base_url}:{self.PORTS['deal']}/api/analysesByProgram/{program_id}"
-            analyses_response = self._session.get(analyses_url)
-            analyses_response.raise_for_status()
-            analyses_data = analyses_response.json()
-        except Exception:
-            # Analyses not available (older Foundation version or other error)
-            # Continue without analyses
-            pass
-
-        return Program(program_data, self._ref_cache, analyses_data, self)
+        return Program(program_data, self._ref_cache, self._analyses_cache[program_id], self)
 
     def get_layer(self, layer_id: int) -> "Layer":
         """
@@ -465,6 +502,156 @@ class FoundationClient:
         if self._ref_cache is None:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_all_participants()
+
+    def get_vendor(self, identifier: Union[int, str]) -> Optional["Vendor"]:
+        """
+        Get vendor by ID or name.
+
+        Args:
+            identifier: Either an integer ID or a string name
+
+        Returns:
+            Vendor instance or None if not found
+
+        Example:
+            >>> vendor = client.get_vendor("RMS")
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_vendor(identifier)
+
+    def get_all_vendors(self) -> List["Vendor"]:
+        """
+        Get all vendors.
+
+        Returns:
+            List of all Vendor instances
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_all_vendors()
+
+    def get_variant(self, identifier: Union[int, str]) -> Optional["Variant"]:
+        """
+        Get variant by ID or name.
+
+        Args:
+            identifier: Either an integer ID or a string name
+
+        Returns:
+            Variant instance or None if not found
+
+        Example:
+            >>> variant = client.get_variant("EP")
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_variant(identifier)
+
+    def get_all_variants(self) -> List["Variant"]:
+        """
+        Get all variants.
+
+        Returns:
+            List of all Variant instances
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_all_variants()
+
+    def get_perspective(
+        self, identifier: Union[int, str]
+    ) -> Optional["Perspective"]:
+        """
+        Get perspective by ID or name.
+
+        Args:
+            identifier: Either an integer ID or a string name
+
+        Returns:
+            Perspective instance or None if not found
+
+        Example:
+            >>> perspective = client.get_perspective("Gross")
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_perspective(identifier)
+
+    def get_all_perspectives(self) -> List["Perspective"]:
+        """
+        Get all perspectives.
+
+        Returns:
+            List of all Perspective instances
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_all_perspectives()
+
+    def get_event_set(self, identifier: Union[int, str]) -> Optional["EventSet"]:
+        """
+        Get event set by ID or name.
+
+        Args:
+            identifier: Either an integer ID or a string name
+
+        Returns:
+            EventSet instance or None if not found
+
+        Example:
+            >>> event_set = client.get_event_set("Standard")
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_event_set(identifier)
+
+    def get_all_event_sets(self) -> List["EventSet"]:
+        """
+        Get all event sets.
+
+        Returns:
+            List of all EventSet instances
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_all_event_sets()
+
+    def get_client(self, identifier: Union[int, str]) -> Optional["Client"]:
+        """Get a client by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_client(identifier)
+
+    def get_all_clients(self) -> List["Client"]:
+        """Get all clients."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_all_clients()
+
+    def get_category(self, category_id: int) -> Optional[Dict[str, Any]]:
+        """Get a category by ID (raw dict from /api/ref)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_category(category_id)
+
+    def get_all_categories(self) -> List[Dict[str, Any]]:
+        """Get all categories as raw dicts."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_all_categories()
+
+    def get_category_detail(self, detail_id: int) -> Optional[Dict[str, Any]]:
+        """Get a category detail by ID (raw dict from /api/ref)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_category_detail(detail_id)
+
+    def get_all_category_details(self) -> List[Dict[str, Any]]:
+        """Get all category details as raw dicts."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_all_category_details()
 
     # Module-Level Custom Tables Access Methods (v0.5.0)
 

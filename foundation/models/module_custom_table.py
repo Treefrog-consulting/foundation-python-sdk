@@ -74,12 +74,10 @@ class ModuleCustomTable:
         if self._loaded:
             return
 
-        # Call API endpoint to get custom table data
-        url = f"{self._client.base_url}:{self._client.PORTS['deal']}/api/customTables/getByCustomTableDefinition/{self._table_id}"
-        response = self._client._session.get(url)
-        response.raise_for_status()
-
-        raw_rows = response.json()
+        raw_rows = self._client._fetch(
+            "deal",
+            f"/api/customTables/getByCustomTableDefinition/{self._table_id}",
+        )
 
         # Process rows using reference cache to build proper column names
         self._rows = []

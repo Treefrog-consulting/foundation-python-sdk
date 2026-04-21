@@ -11,6 +11,7 @@ from ..utils import (
     resolve_snake_case_collisions,
     snake_to_camel,
 )
+from ._init_helpers import build_custom_field_values, resolve_or_create_custom_table
 from .collections import NamedCollection
 from .custom_table import CustomTable
 from .layer import Layer
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from .client import Client
+    from .loss_group import LossGroup
 
 
 class Program:
@@ -44,27 +46,11 @@ class Program:
         # Store run configurations if provided
         self._run_configurations = RunConfigurations(analyses_data or [])
 
-        # Build collision-aware mapping for custom fields
-        program_custom_field_names = []
-        for cf in program_data.get("programCustomFields", []):
-            field_def = ref_cache.get_custom_field(cf.get("customFieldId"))
-            if field_def:
-                program_custom_field_names.append(field_def["name"])
-
-        self._custom_field_name_mapping = resolve_snake_case_collisions(
-            program_custom_field_names
+        self._custom_field_name_mapping, self._custom_field_values = (
+            build_custom_field_values(
+                program_data.get("programCustomFields", []), ref_cache
+            )
         )
-
-        # Process custom fields with collision-aware names
-        self._custom_field_values = {}
-        for cf in program_data.get("programCustomFields", []):
-            field_def = ref_cache.get_custom_field(cf.get("customFieldId"))
-            if field_def:
-                original_name = field_def["name"]
-                field_name = self._custom_field_name_mapping.get(
-                    original_name, camel_to_snake(original_name)
-                )
-                self._custom_field_values[field_name] = cf.get("value")
 
         # Process custom tables
         raw_table_rows: Dict[str, List[Dict[str, Any]]] = {}
@@ -446,58 +432,15 @@ class Program:
             >>> df = claims_history.as_pandas()
             >>> df.head()
         """
-        snake_name = camel_to_snake(table_name)
-        table = self._custom_tables.get(snake_name)
-        if table:
-            return table
-
-        # Try to locate by original name in metadata.
-        for info in self._custom_tables_info:
-            if info["name"] == table_name or info["snake_case_name"] == snake_name:
-                return self._custom_tables[info["snake_case_name"]]
-
-        # Fallback: create an empty table definition if it exists in reference data.
-        target_id = None
-        column_names: List[str] = []
-        resolved_name = table_name
-        for table_id, table_def in self._ref_cache._custom_tables.items():
-            if table_def.get("dataLevelId") in [2, 4]:
-                current_snake = camel_to_snake(table_def["name"])
-                if table_def["name"] == table_name or current_snake == snake_name:
-                    target_id = table_id
-                    resolved_name = table_def["name"]
-                    snake_name = current_snake
-                    columns = self._ref_cache.get_custom_table_columns(table_id)
-                    column_names = [col["name"] for col in columns]
-                    break
-
-        new_table = CustomTable(
+        return resolve_or_create_custom_table(
+            table_name,
             owner=self,
             ref_cache=self._ref_cache,
-            table_id=target_id,
-            snake_name=snake_name,
-            original_name=resolved_name,
-            column_names=column_names,
-            initial_rows=[],
+            custom_tables=self._custom_tables,
+            custom_tables_info=self._custom_tables_info,
+            custom_table_original_names=self._custom_table_original_names,
+            data_level_ids=(2, 4),
         )
-        self._custom_tables[snake_name] = new_table
-        self._custom_table_original_names.setdefault(snake_name, resolved_name)
-
-        if not any(
-            info["snake_case_name"] == snake_name for info in self._custom_tables_info
-        ):
-            self._custom_tables_info.append(
-                {
-                    "id": target_id,
-                    "name": resolved_name,
-                    "snake_case_name": snake_name,
-                    "column_count": len(column_names),
-                    "columns": column_names,
-                }
-            )
-            self._custom_tables_info.sort(key=lambda x: x["name"])
-
-        return new_table
 
     def _mark_custom_table_modified(self, table_name: str) -> None:
         """Mark a custom table as modified to include it in JSON output."""
@@ -523,6 +466,23 @@ class Program:
             del self._modifications[snake_name]
         table = self.get_custom_table(table_name)
         table.set_data(rows)
+
+    def create_loss_group(self, name: str) -> "LossGroup":
+        """Create a new LossGroup builder attached to this program.
+
+        Add loss sets via add_yelt / add_elt, then call upload().
+
+        Args:
+            name: Display name for the loss group.
+
+        Returns:
+            LossGroup builder instance.
+        """
+        from .loss_group import LossGroup
+
+        return LossGroup(
+            client=self._foundation_client, program_id=self.id, name=name
+        )
 
     def get_json(self) -> Dict[str, Any]:
         """
@@ -626,113 +586,114 @@ class Program:
             )
             result["programCustomFields"] = custom_fields
 
+    def _find_custom_table_id(self, table_name: str) -> Optional[int]:
+        """Resolve a snake_case table_name to its program-level table id."""
+        for tid, table_def in self._ref_cache._custom_tables.items():
+            # Program level can be dataLevelId 2 or 4.
+            if table_def.get("dataLevelId") in [2, 4]:
+                if camel_to_snake(table_def["name"]) == table_name:
+                    return tid
+        return None
+
+    def _build_column_mapping(
+        self, table_id: int
+    ) -> "tuple[Dict[str, str], Dict[str, int]]":
+        """Return (column_name -> raw-field-name, lookup-column-name -> accessible-object-id)."""
+        from ._custom_table_fields import LOOKUP_VALUE_TYPE, field_name_for_column
+
+        column_to_field: Dict[str, str] = {}
+        lookup_columns: Dict[str, int] = {}
+        for col in self._ref_cache.get_custom_table_columns(table_id):
+            field_name = field_name_for_column(col)
+            if field_name is None:
+                continue
+            col_name = col["name"]
+            column_to_field[col_name] = field_name
+            if col["valueType"] == LOOKUP_VALUE_TYPE:
+                lookup_object_id = col.get("lookupObjectId")
+                if lookup_object_id is not None:
+                    lookup_columns[col_name] = lookup_object_id
+        return column_to_field, lookup_columns
+
+    def _build_raw_table_row(
+        self,
+        table_id: int,
+        program_id: Any,
+        sort_order: int,
+        original_rows: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Return a raw row dict, preserving id/metadata from the original if present."""
+        from ._custom_table_fields import initialize_blank_fields
+
+        if sort_order < len(original_rows):
+            raw_row = copy.deepcopy(original_rows[sort_order])
+            raw_row["sortOrder"] = sort_order
+            return raw_row
+
+        raw_row = {
+            "id": None,  # Will be assigned by API
+            "customTableDefinitionId": table_id,
+            "customTableDefinition": None,
+            "programId": program_id,
+            "layerId": None,
+            "layer": None,
+            "sortOrder": sort_order,
+        }
+        initialize_blank_fields(raw_row)
+        return raw_row
+
+    def _apply_row_values(
+        self,
+        raw_row: Dict[str, Any],
+        row_data: Dict[str, Any],
+        column_to_field: Dict[str, str],
+        lookup_columns: Dict[str, int],
+    ) -> None:
+        """Project user values into the raw typed slots on ``raw_row``."""
+        for col_name, user_value in row_data.items():
+            field_name = column_to_field.get(col_name)
+            if not field_name:
+                continue
+            if col_name in lookup_columns and user_value is not None:
+                user_value = self._ref_cache.reverse_lookup_value(
+                    lookup_columns[col_name], user_value
+                )
+            if isinstance(user_value, (date, datetime)):
+                user_value = (
+                    user_value.isoformat()
+                    if isinstance(user_value, datetime)
+                    else f"{user_value}T00:00:00"
+                )
+            raw_row[field_name] = user_value
+
     def _update_custom_table_in_json(
         self, result: Dict[str, Any], table_name: str, value: List[Dict[str, Any]]
     ) -> None:
-        """
-        Update a custom table in the customTables array.
+        """Update a custom table in the customTables array.
 
         Converts user-friendly column names back to internal field names
         (numValue1, textValue1, dateValue1, etc.) and maintains row order.
         """
-        # Find the custom table definition
-        table_id = None
-        for tid, table_def in self._ref_cache._custom_tables.items():
-            # Program level can be dataLevelId 2 or 4
-            if table_def.get("dataLevelId") in [2, 4]:
-                if camel_to_snake(table_def["name"]) == table_name:
-                    table_id = tid
-                    break
-
+        table_id = self._find_custom_table_id(table_name)
         if table_id is None:
             return
 
-        # Get column definitions to map column names to internal fields
-        columns = self._ref_cache.get_custom_table_columns(table_id)
-
-        # Build mapping from column name to internal field
-        column_to_field = {}
-        # Track lookup columns for reverse resolution (display label -> raw ID)
-        lookup_columns: Dict[str, int] = {}  # col_name -> lookupObjectId
-        for col in columns:
-            col_name = col["name"]
-            value_type = col["valueType"]
-            field_num = col["valueFieldNum"]
-
-            field_map = {
-                1: f"numValue{field_num}",
-                2: f"dateValue{field_num}",
-                3: f"bitValue{field_num}",
-                4: f"textValue{field_num}",
-                5: f"lookupValue{field_num}",
-            }
-
-            field_name = field_map.get(value_type)
-            if field_name:
-                column_to_field[col_name] = field_name
-                # Track lookup columns for reverse resolution
-                if value_type == 5:
-                    lookup_object_id = col.get("lookupObjectId")
-                    if lookup_object_id is not None:
-                        lookup_columns[col_name] = lookup_object_id
-
-        # Remove existing rows for this table
-        custom_tables = result.get("customTables", [])
-        custom_tables = [
-            ct
-            for ct in custom_tables
-            if ct.get("customTableDefinitionId") != table_id
-            or ct.get("programId") != result.get("id")
-        ]
-
-        # Get original rows for this table to preserve metadata
+        column_to_field, lookup_columns = self._build_column_mapping(table_id)
+        program_id = result.get("id")
         original_rows = self._custom_table_original_rows.get(table_name, [])
 
-        # Add new rows
+        # Drop existing rows for this program + table, then rebuild in order.
+        custom_tables = [
+            ct
+            for ct in result.get("customTables", [])
+            if ct.get("customTableDefinitionId") != table_id
+            or ct.get("programId") != program_id
+        ]
         for sort_order, row_data in enumerate(value):
-            # Start with original row if available to preserve id and other metadata
-            if sort_order < len(original_rows):
-                raw_row = copy.deepcopy(original_rows[sort_order])
-                # Update sortOrder in case it changed
-                raw_row["sortOrder"] = sort_order
-            else:
-                # New row - create from scratch
-                raw_row = {
-                    "id": None,  # Will be assigned by API
-                    "customTableDefinitionId": table_id,
-                    "customTableDefinition": None,
-                    "programId": result.get("id"),
-                    "layerId": None,
-                    "layer": None,
-                    "sortOrder": sort_order,
-                }
-
-                # Initialize all possible value fields to None
-                for i in range(1, 31):  # Assuming max 30 fields of each type
-                    raw_row[f"numValue{i}"] = None
-                    raw_row[f"textValue{i}"] = None
-                    raw_row[f"bitValue{i}"] = None
-                    raw_row[f"dateValue{i}"] = None
-                    raw_row[f"lookupValue{i}"] = None
-
-            # Map user values to internal fields
-            for col_name, user_value in row_data.items():
-                field_name = column_to_field.get(col_name)
-                if field_name:
-                    # Reverse-resolve lookup display labels back to raw IDs
-                    if col_name in lookup_columns and user_value is not None:
-                        user_value = self._ref_cache.reverse_lookup_value(
-                            lookup_columns[col_name], user_value
-                        )
-                    # Convert date/datetime objects to ISO strings
-                    if isinstance(user_value, (date, datetime)):
-                        user_value = (
-                            user_value.isoformat()
-                            if isinstance(user_value, datetime)
-                            else f"{user_value}T00:00:00"
-                        )
-                    raw_row[field_name] = user_value
-
+            raw_row = self._build_raw_table_row(
+                table_id, program_id, sort_order, original_rows
+            )
+            self._apply_row_values(raw_row, row_data, column_to_field, lookup_columns)
             custom_tables.append(raw_row)
 
         result["customTables"] = custom_tables
@@ -814,12 +775,41 @@ class Program:
         print(f"PROGRAM: {self.name or 'Untitled'} (ID: {self.id})")
         print("=" * 80)
 
-        # Standard Properties
+        self._describe_standard_properties()
+        self._describe_reference_data()
+        self._describe_attr_section("CATEGORIES", "Category", self.categories)
+        self._describe_attr_section(
+            "EXTERNAL REFERENCES", "System", self.external_refs
+        )
+        self._describe_custom_fields()
+        self._describe_custom_tables()
+
+        print("\nCOLLECTIONS:")
+        print(f"  brokers                        {len(self.brokers)} item(s)")
+        print(f"  layers                         {len(self.layers)} item(s)")
+
+        print("\nAVAILABLE METHODS:")
+        for method in (
+            "get_custom_field(field_name)",
+            "set_custom_field(field_name, value)",
+            "get_custom_table(table_name)",
+            "set_custom_table(table_name, rows)",
+            "get_json()",
+            "describe()",
+        ):
+            print(f"  ΓÇó {method}")
+
+        print("\n" + "=" * 80)
+        print(
+            "TIP: Use dot notation to access any attribute (e.g., program.portfolio_tag)"
+        )
+        print("=" * 80 + "\n")
+
+    def _describe_standard_properties(self) -> None:
         print("\nSTANDARD PROPERTIES:")
         print(f"  {'Property':<30} {'Access':<10} {'Current Value':<30}")
         print(f"  {'-' * 30} {'-' * 10} {'-' * 30}")
-
-        standard_props = [
+        for prop_name, access, value in (
             ("id", "read-only", self.id),
             ("name", "read-write", self.name),
             ("description", "read-write", self.description),
@@ -828,119 +818,65 @@ class Program:
             ("renewal_flag", "read-write", self.renewal_flag),
             ("note", "read-write", self.note),
             ("years_on_account", "read-write", self.years_on_account),
-        ]
-
-        for prop_name, access, value in standard_props:
+        ):
             value_str = str(value)[:28] if value is not None else "None"
             print(f"  {prop_name:<30} {access:<10} {value_str:<30}")
 
-        # Reference Data
+    def _describe_reference_data(self) -> None:
         print("\nREFERENCE DATA (read-only):")
         print(f"  {'Property':<30} {'Value':<40}")
         print(f"  {'-' * 30} {'-' * 40}")
-
         client_name = self.client.name if self.client else None
-        print(
-            f"  {'client':<30} {str(client_name)[:38] if client_name else 'None':<40}"
-        )
+        value = str(client_name)[:38] if client_name else "None"
+        print(f"  {'client':<30} {value:<40}")
 
-        # Categories
-        print("\nCATEGORIES:")
-        if self.categories:
-            print(f"  {'Category':<35} {'Value':<35}")
-            print(f"  {'-' * 35} {'-' * 35}")
-            category_attrs = [
-                attr for attr in dir(self.categories) if not attr.startswith("_")
-            ]
-            for cat_name in sorted(category_attrs):
-                try:
-                    cat_value = getattr(self.categories, cat_name)
-                    if not callable(cat_value):
-                        value_str = (
-                            str(cat_value)[:33] if cat_value is not None else "None"
-                        )
-                        print(f"  {cat_name:<35} {value_str:<35}")
-                except AttributeError:
-                    pass
-        else:
+    def _describe_attr_section(self, title: str, label: str, obj: Any) -> None:
+        """Print a section that lists every public attribute of ``obj`` as key/value."""
+        print(f"\n{title}:")
+        if not obj:
             print("  (none)")
+            return
+        print(f"  {label:<35} {'Value':<35}")
+        print(f"  {'-' * 35} {'-' * 35}")
+        for attr in sorted(a for a in dir(obj) if not a.startswith("_")):
+            try:
+                value = getattr(obj, attr)
+            except AttributeError:
+                continue
+            if callable(value):
+                continue
+            value_str = str(value)[:33] if value is not None else "None"
+            print(f"  {attr:<35} {value_str:<35}")
 
-        # External References
-        print("\nEXTERNAL REFERENCES:")
-        if self.external_refs:
-            print(f"  {'System':<35} {'Value':<35}")
-            print(f"  {'-' * 35} {'-' * 35}")
-            ext_ref_attrs = [
-                attr for attr in dir(self.external_refs) if not attr.startswith("_")
-            ]
-            for ref_name in sorted(ext_ref_attrs):
-                try:
-                    ref_value = getattr(self.external_refs, ref_name)
-                    if not callable(ref_value):
-                        value_str = (
-                            str(ref_value)[:33] if ref_value is not None else "None"
-                        )
-                        print(f"  {ref_name:<35} {value_str:<35}")
-                except AttributeError:
-                    pass
-        else:
-            print("  (none)")
-
-        # Custom Fields
-        if self._custom_field_values:
-            print("\nCUSTOM FIELDS:")
-            print(f"  {'Field Name':<35} {'Value':<35}")
-            print(f"  {'-' * 35} {'-' * 35}")
-            for key, value in sorted(self._custom_field_values.items()):
-                value_str = str(value)[:33] if value is not None else "None"
-                print(f"  {key:<35} {value_str:<35}")
-            print(
-                f"\n  Available Custom Field Names: {', '.join(self.custom_fields_names) or '(none)'}"
-            )
-        else:
+    def _describe_custom_fields(self) -> None:
+        if not self._custom_field_values:
             print("\nCUSTOM FIELDS: (none)")
-
-        # Custom Tables
-        if self._custom_tables:
-            print("\nCUSTOM TABLES:")
-            print(f"  {'Table Name':<35} {'Rows':<10}")
-            print(f"  {'-' * 35} {'-' * 10}")
-            for snake_name in sorted(self._custom_tables.keys()):
-                table = self._custom_tables[snake_name]
-                row_count = table.row_count
-                display_name = table.name
-                print(f"  {display_name:<35} {row_count:<10}")
-            print(
-                f"\n  Available Custom Table Names: {', '.join(self.custom_tables_names) or '(none)'}"
-            )
-        else:
-            print("\nCUSTOM TABLES: (none)")
-
-        # Collections
-        print("\nCOLLECTIONS:")
-        brokers_count = len(self.brokers)
-        layers_count = len(self.layers)
-        print(f"  brokers                        {brokers_count} item(s)")
-        print(f"  layers                         {layers_count} item(s)")
-
-        # Methods
-        print("\nAVAILABLE METHODS:")
-        methods = [
-            "get_custom_field(field_name)",
-            "set_custom_field(field_name, value)",
-            "get_custom_table(table_name)",
-            "set_custom_table(table_name, rows)",
-            "get_json()",
-            "describe()",
-        ]
-        for method in methods:
-            print(f"  ΓÇó {method}")
-
-        print("\n" + "=" * 80)
+            return
+        print("\nCUSTOM FIELDS:")
+        print(f"  {'Field Name':<35} {'Value':<35}")
+        print(f"  {'-' * 35} {'-' * 35}")
+        for key, value in sorted(self._custom_field_values.items()):
+            value_str = str(value)[:33] if value is not None else "None"
+            print(f"  {key:<35} {value_str:<35}")
         print(
-            "TIP: Use dot notation to access any attribute (e.g., program.portfolio_tag)"
+            f"\n  Available Custom Field Names: "
+            f"{', '.join(self.custom_fields_names) or '(none)'}"
         )
-        print("=" * 80 + "\n")
+
+    def _describe_custom_tables(self) -> None:
+        if not self._custom_tables:
+            print("\nCUSTOM TABLES: (none)")
+            return
+        print("\nCUSTOM TABLES:")
+        print(f"  {'Table Name':<35} {'Rows':<10}")
+        print(f"  {'-' * 35} {'-' * 10}")
+        for snake_name in sorted(self._custom_tables.keys()):
+            table = self._custom_tables[snake_name]
+            print(f"  {table.name:<35} {table.row_count:<10}")
+        print(
+            f"\n  Available Custom Table Names: "
+            f"{', '.join(self.custom_tables_names) or '(none)'}"
+        )
 
     def __dir__(self) -> List[str]:
         """

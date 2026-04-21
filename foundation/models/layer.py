@@ -11,6 +11,7 @@ from ..utils import (
     resolve_snake_case_collisions,
     snake_to_camel,
 )
+from ._init_helpers import build_custom_field_values, resolve_or_create_custom_table
 from .custom_table import CustomTable
 from .layer_participant import LayerParticipant
 from .layered_losses import LayeredLosses
@@ -46,27 +47,11 @@ class Layer:
         self._layered_losses = LayeredLosses(self)
         self._ylt = Ylt(self)
 
-        # Build collision-aware mapping for custom fields
-        layer_custom_field_names = []
-        for cf in layer_data.get("layerCustomFields", []):
-            field_def = ref_cache.get_custom_field(cf.get("customFieldId"))
-            if field_def:
-                layer_custom_field_names.append(field_def["name"])
-
-        self._custom_field_name_mapping = resolve_snake_case_collisions(
-            layer_custom_field_names
+        self._custom_field_name_mapping, self._custom_field_values = (
+            build_custom_field_values(
+                layer_data.get("layerCustomFields", []), ref_cache
+            )
         )
-
-        # Process custom fields with collision-aware names
-        self._custom_field_values = {}
-        for cf in layer_data.get("layerCustomFields", []):
-            field_def = ref_cache.get_custom_field(cf.get("customFieldId"))
-            if field_def:
-                original_name = field_def["name"]
-                field_name = self._custom_field_name_mapping.get(
-                    original_name, camel_to_snake(original_name)
-                )
-                self._custom_field_values[field_name] = cf.get("value")
 
         # Process custom tables
         raw_table_rows: Dict[str, List[Dict[str, Any]]] = {}
@@ -537,56 +522,15 @@ class Layer:
             >>> buffer_layer = layer.get_custom_table('Buffer Layer 1')
             >>> buffer_layer.as_pandas().head()
         """
-        snake_name = camel_to_snake(table_name)
-        table = self._custom_tables.get(snake_name)
-        if table:
-            return table
-
-        for info in self._custom_tables_info:
-            if info["name"] == table_name or info["snake_case_name"] == snake_name:
-                return self._custom_tables[info["snake_case_name"]]
-
-        target_id = None
-        column_names: List[str] = []
-        resolved_name = table_name
-        for table_id, table_def in self._ref_cache._custom_tables.items():
-            if table_def.get("dataLevelId") == 3:
-                current_snake = camel_to_snake(table_def["name"])
-                if table_def["name"] == table_name or current_snake == snake_name:
-                    target_id = table_id
-                    resolved_name = table_def["name"]
-                    snake_name = current_snake
-                    columns = self._ref_cache.get_custom_table_columns(table_id)
-                    column_names = [col["name"] for col in columns]
-                    break
-
-        new_table = CustomTable(
+        return resolve_or_create_custom_table(
+            table_name,
             owner=self,
             ref_cache=self._ref_cache,
-            table_id=target_id,
-            snake_name=snake_name,
-            original_name=resolved_name,
-            column_names=column_names,
-            initial_rows=[],
+            custom_tables=self._custom_tables,
+            custom_tables_info=self._custom_tables_info,
+            custom_table_original_names=self._custom_table_original_names,
+            data_level_ids=(3,),
         )
-        self._custom_tables[snake_name] = new_table
-        self._custom_table_original_names.setdefault(snake_name, resolved_name)
-
-        if not any(
-            info["snake_case_name"] == snake_name for info in self._custom_tables_info
-        ):
-            self._custom_tables_info.append(
-                {
-                    "id": target_id,
-                    "name": resolved_name,
-                    "snake_case_name": snake_name,
-                    "column_count": len(column_names),
-                    "columns": column_names,
-                }
-            )
-            self._custom_tables_info.sort(key=lambda x: x["name"])
-
-        return new_table
 
     def _mark_custom_table_modified(self, table_name: str) -> None:
         """Mark a custom table as modified to include it in JSON output."""
@@ -670,13 +614,9 @@ class Layer:
         if table_id is None:
             return copy.deepcopy(row)
 
-        raw_keys = row.keys()
-        if any(
-            key.startswith(
-                ("numValue", "textValue", "bitValue", "dateValue", "lookupValue")
-            )
-            for key in raw_keys
-        ):
+        from ._custom_table_fields import FIELD_PREFIXES_TUPLE
+
+        if any(key.startswith(FIELD_PREFIXES_TUPLE) for key in row.keys()):
             return self._ref_cache.build_custom_table_row(row, table_id)
         return copy.deepcopy(row)
 
@@ -878,34 +818,25 @@ class Layer:
         if table_id is None:
             return
 
-        # Get column definitions to map column names to internal fields
-        columns = self._ref_cache.get_custom_table_columns(table_id)
+        from ._custom_table_fields import (
+            LOOKUP_VALUE_TYPE,
+            field_name_for_column,
+        )
 
         # Build mapping from column name to internal field
         column_to_field = {}
         # Track lookup columns for reverse resolution (display label -> raw ID)
         lookup_columns = {}  # col_name -> lookupObjectId
-        for col in columns:
+        for col in self._ref_cache.get_custom_table_columns(table_id):
+            field_name = field_name_for_column(col)
+            if field_name is None:
+                continue
             col_name = col["name"]
-            value_type = col["valueType"]
-            field_num = col["valueFieldNum"]
-
-            field_map = {
-                1: f"numValue{field_num}",
-                2: f"dateValue{field_num}",
-                3: f"bitValue{field_num}",
-                4: f"textValue{field_num}",
-                5: f"lookupValue{field_num}",
-            }
-
-            field_name = field_map.get(value_type)
-            if field_name:
-                column_to_field[col_name] = field_name
-                # Track lookup columns for reverse resolution
-                if value_type == 5:
-                    lookup_object_id = col.get("lookupObjectId")
-                    if lookup_object_id is not None:
-                        lookup_columns[col_name] = lookup_object_id
+            column_to_field[col_name] = field_name
+            if col["valueType"] == LOOKUP_VALUE_TYPE:
+                lookup_object_id = col.get("lookupObjectId")
+                if lookup_object_id is not None:
+                    lookup_columns[col_name] = lookup_object_id
 
         # Get original rows for this table to preserve metadata
         original_rows = self._custom_table_original_rows.get(table_name, [])
@@ -930,13 +861,8 @@ class Layer:
                     "sortOrder": sort_order,
                 }
 
-                # Initialize all possible value fields to None
-                for i in range(1, 31):  # Assuming max 30 fields of each type
-                    raw_row[f"numValue{i}"] = None
-                    raw_row[f"textValue{i}"] = None
-                    raw_row[f"bitValue{i}"] = None
-                    raw_row[f"dateValue{i}"] = None
-                    raw_row[f"lookupValue{i}"] = None
+                from ._custom_table_fields import initialize_blank_fields
+                initialize_blank_fields(raw_row)
 
             # Map user values to internal fields
             for col_name, user_value in row_data.items():
