@@ -6,15 +6,18 @@ columns ``numValue1..N``, ``textValue1..N``, etc. The column definition
 This module centralizes that mapping so it isn't re-declared in every consumer.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any
 
 # valueType id -> raw-row field prefix. Matches the server's CustomField enum.
-FIELD_TYPE_PREFIXES: Dict[int, str] = {
+FIELD_TYPE_PREFIXES: dict[int, str] = {
     1: "numValue",
     2: "dateValue",
     3: "bitValue",
     4: "textValue",
     5: "lookupValue",
+    # MultilineText shares the textValue slots with Text; without this entry
+    # multi-line columns are silently dropped from custom-table rows.
+    6: "textValue",
 }
 
 LOOKUP_VALUE_TYPE = 5
@@ -26,7 +29,7 @@ MAX_CUSTOM_FIELDS_PER_TYPE = 30
 FIELD_PREFIXES_TUPLE = tuple(FIELD_TYPE_PREFIXES.values())
 
 
-def field_name_for_column(col: Dict[str, Any]) -> Optional[str]:
+def field_name_for_column(col: dict[str, Any]) -> str | None:
     """Return the raw-row field name (e.g. ``numValue1``) for a column def, or None."""
     prefix = FIELD_TYPE_PREFIXES.get(col["valueType"])
     if prefix is None:
@@ -34,7 +37,7 @@ def field_name_for_column(col: Dict[str, Any]) -> Optional[str]:
     return f"{prefix}{col['valueFieldNum']}"
 
 
-def initialize_blank_fields(raw_row: Dict[str, Any]) -> None:
+def initialize_blank_fields(raw_row: dict[str, Any]) -> None:
     """Populate ``raw_row`` with None for every typed slot the server expects."""
     for prefix in FIELD_TYPE_PREFIXES.values():
         for i in range(1, MAX_CUSTOM_FIELDS_PER_TYPE + 1):

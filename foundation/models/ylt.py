@@ -60,15 +60,7 @@ class Ylt(_LossExportAccessor):
         return super().as_pandas(run_config)
 
     def _read_frame(self, con: Any, format_method: str) -> Any:
-        tables = con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_name = 'ylt_losses'"
-        ).fetchall()
-        if not tables:
-            raise RuntimeError(
-                "No YLT data available for this program. "
-                "The DuckDB file does not contain a ylt_losses table."
-            )
+        self._require_table(con, "ylt_losses")
 
         columns = con.execute(
             "SELECT column_name FROM information_schema.columns "
@@ -82,11 +74,6 @@ class Ylt(_LossExportAccessor):
         )
         return getattr(query, format_method)()
 
-    def __dir__(self):
-        attrs = set(super().__dir__())
-        attrs.update(["as_polars", "as_pandas", "describe", "__call__"])
-        return sorted(attrs)
-
     def describe(self) -> None:
         """Display a summary of this YLT accessor.
 
@@ -97,7 +84,7 @@ class Ylt(_LossExportAccessor):
         print("YLT (Year Loss Table)")
         print("=" * 60)
         print(f"  Layer: {self._layer.name} (id={self._layer.id})")
-        print(f"  Cached configs: {len(self._cache)}")
+        print(f"  Cached exports (deal-wide): {self._cached_export_count()}")
         print()
         print("USAGE:")
         print("  layer.ylt(run_config)  -> polars.DataFrame (default)")

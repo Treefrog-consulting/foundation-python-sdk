@@ -3,37 +3,87 @@
 A Python SDK for interacting with the Foundation Platform API.
 """
 
-from .exceptions import LossGroupAttachError, LossSetValidationError
+from .exceptions import (
+    AuthenticationError,
+    ConflictError,
+    ExportError,
+    FoundationError,
+    FoundationHTTPError,
+    LossGroupAttachError,
+    LossSetValidationError,
+    NotFoundError,
+    PermissionDeniedError,
+    RateLimitError,
+    ReadOnlyVersionError,
+    ServerError,
+    ValidationError,
+)
 from .models import (
     FoundationClient,
     Layer,
+    LayeredLosses,
     LossGroup,
     LossGroupUploadResult,
     LossSetResult,
+    MetricResults,
+    ModuleCustomTable,
+    NamedCollection,
     Program,
+    ProgramVersion,
+    ProgramVersions,
     ReferenceRun,
     ReferenceRuns,
+    ReferenceTable,
     RunConfiguration,
+    RunConfigurations,
+    Ylt,
 )
 
-__version__ = "0.8.0"
+__version__ = "0.12.0"
 __all__ = [
+    "AuthenticationError",
+    "ConflictError",
+    "ExportError",
     "FoundationClient",
-    "Program",
+    "FoundationError",
+    "FoundationHTTPError",
     "Layer",
+    "LayeredLosses",
+    "LossGroup",
+    "LossGroupAttachError",
+    "LossGroupUploadResult",
+    "LossSetResult",
+    "LossSetValidationError",
+    "MetricResults",
+    "ModuleCustomTable",
+    "NamedCollection",
+    "NotFoundError",
+    "PermissionDeniedError",
+    "Program",
+    "ProgramVersion",
+    "ProgramVersions",
+    "RateLimitError",
+    "ReadOnlyVersionError",
     "ReferenceRun",
     "ReferenceRuns",
+    "ReferenceTable",
     "RunConfiguration",
-    "LossSetValidationError",
-    "LossGroupAttachError",
-    "LossGroup",
-    "LossSetResult",
-    "LossGroupUploadResult",
+    "RunConfigurations",
+    "ServerError",
+    "ValidationError",
+    "Ylt",
+    "get_client",
 ]
 
 
 def get_client(
-    email: str, password: str, api_client_id: str, api_client_secret: str, base_url: str
+    *,
+    email: str,
+    password: str,
+    api_client_id: str,
+    api_client_secret: str,
+    base_url: str,
+    timeout: float | None = FoundationClient.DEFAULT_TIMEOUT,
 ) -> FoundationClient:
     """
     Create and authenticate a Foundation Platform client.
@@ -44,6 +94,7 @@ def get_client(
         api_client_id: API client ID
         api_client_secret: API client secret
         base_url: Base URL for the API (e.g., "https://your-instance.foundationplatform.com")
+        timeout: Per-socket timeout in seconds for every request; None waits forever
 
     Returns:
         Authenticated FoundationClient instance
@@ -60,6 +111,6 @@ def get_client(
         >>> program = client.get_program(2455)
         >>> print(program.name)
     """
-    client = FoundationClient(base_url=base_url)
+    client = FoundationClient(base_url=base_url, timeout=timeout)
     client.authenticate(email, password, api_client_id, api_client_secret)
     return client

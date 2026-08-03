@@ -6,9 +6,10 @@ attach the group to the program."""
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Literal, Mapping, Optional, Union
+from typing import TYPE_CHECKING, Any, Literal
 
 import requests
 
@@ -42,14 +43,14 @@ class _QueuedLossSet:
     variant_id: int
     vendor_id: int
     sim_years: int
-    note: Optional[str] = None
+    note: str | None = None
     nmp_flag: bool = False
-    nmp_model_id: Optional[int] = None
-    event_split_view_id: Optional[int] = None
+    nmp_model_id: int | None = None
+    event_split_view_id: int | None = None
 
 
 class LossGroup:
-    def __init__(self, client: "FoundationClient", program_id: int, name: str):
+    def __init__(self, client: FoundationClient, program_id: int, name: str):
         if not name or not name.strip():
             raise LossSetValidationError("name is required")
         self._client = client
@@ -71,17 +72,17 @@ class LossGroup:
         name: str,
         data: Any,
         currency_code: str,
-        event_set_id: Union[int, str],
-        perspective_id: Union[int, str],
-        variant_id: Union[int, str],
-        vendor_id: Union[int, str],
+        event_set_id: int | str,
+        perspective_id: int | str,
+        variant_id: int | str,
+        vendor_id: int | str,
         sim_years: int = 0,
-        note: Optional[str] = None,
+        note: str | None = None,
         nmp_flag: bool = False,
-        nmp_model_id: Optional[int] = None,
-        event_split_view_id: Optional[int] = None,
-        column_map: Optional[Mapping[str, str]] = None,
-    ) -> "LossGroup":
+        nmp_model_id: int | None = None,
+        event_split_view_id: int | None = None,
+        column_map: Mapping[str, str] | None = None,
+    ) -> LossGroup:
         self._add(
             "yelt",
             name=name,
@@ -106,17 +107,17 @@ class LossGroup:
         name: str,
         data: Any,
         currency_code: str,
-        event_set_id: Union[int, str],
-        perspective_id: Union[int, str],
-        variant_id: Union[int, str],
-        vendor_id: Union[int, str],
+        event_set_id: int | str,
+        perspective_id: int | str,
+        variant_id: int | str,
+        vendor_id: int | str,
         sim_years: int = 0,
-        note: Optional[str] = None,
+        note: str | None = None,
         nmp_flag: bool = False,
-        nmp_model_id: Optional[int] = None,
-        event_split_view_id: Optional[int] = None,
-        column_map: Optional[Mapping[str, str]] = None,
-    ) -> "LossGroup":
+        nmp_model_id: int | None = None,
+        event_split_view_id: int | None = None,
+        column_map: Mapping[str, str] | None = None,
+    ) -> LossGroup:
         self._add(
             "elt",
             name=name,
@@ -137,24 +138,22 @@ class LossGroup:
 
     def upload(
         self,
+        *,
         poll_interval: int = 10,
         timeout: int = 600,
         max_workers: int = 8,
-    ) -> "LossGroupUploadResult":
+    ) -> LossGroupUploadResult:
         if not self._queued:
-            raise LossSetValidationError("no loss sets queued; call add_yelt/add_elt first")
+            raise LossSetValidationError(
+                "no loss sets queued; call add_yelt/add_elt first"
+            )
 
-        session = self._client._session
-        base = self._client.base_url
-        port = self._client.PORTS["loss"]
-        deal_port = self._client.PORTS["deal"]
+        client = self._client
 
         # 1) Create LossSetGroup.
-        group_resp = session.post(
-            f"{base}:{port}/api/LossSetGroups",
-            json={"name": self._name},
+        group_resp = client.request(
+            "loss", "/api/LossSetGroups", method="POST", json={"name": self._name}
         )
-        group_resp.raise_for_status()
         loss_set_group_id = int(group_resp.json()["id"])
 
         # 2) Parallel upload + poll per set.
@@ -175,7 +174,7 @@ class LossGroup:
                 i = futures[fut]
                 try:
                     results[i] = fut.result()
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - one set must not fail the batch
                     results[i] = LossSetResult(
                         name=self._queued[i].name,
                         status="error",
@@ -189,15 +188,16 @@ class LossGroup:
 
         # 3) Attach (always, even if all errored -- so UW can at least see the group).
         try:
-            attach_resp = session.post(
-                f"{base}:{deal_port}/api/Programs/{self._program_id}/AttachLossGroup",
+            attach_resp = client.request(
+                "deal",
+                f"/api/Programs/{self._program_id}/AttachLossGroup",
+                method="POST",
                 json={
                     "lossSetGroupId": loss_set_group_id,
                     "name": self._name,
                     "description": None,
                 },
             )
-            attach_resp.raise_for_status()
             attach_body = attach_resp.json()
             aggregate.program_loss_group_id = int(attach_body["programLossGroupId"])
             aggregate.program_version_id = int(attach_body["programVersionId"])
@@ -211,16 +211,16 @@ class LossGroup:
 
     def _upload_one(
         self,
-        queued: "_QueuedLossSet",
+        queued: _QueuedLossSet,
         loss_set_group_id: int,
         poll_interval: int,
         timeout: int,
-    ) -> "LossSetResult":
-        session = self._client._session
-        base = self._client.base_url
-        port = self._client.PORTS["loss"]
+    ) -> LossSetResult:
+        client = self._client
 
-        def error_result(msg: str, *, loss_set_id=None, file_guid=None) -> "LossSetResult":
+        def error_result(
+            msg: str, *, loss_set_id=None, file_guid=None
+        ) -> LossSetResult:
             return LossSetResult(
                 name=queued.name,
                 status="error",
@@ -231,21 +231,23 @@ class LossGroup:
 
         body = [self._build_loss_set_body(queued, loss_set_group_id)]
         try:
-            post_resp = session.post(f"{base}:{port}/api/LossSets", json=body)
-            post_resp.raise_for_status()
+            post_resp = client.request(
+                "loss", "/api/LossSets", method="POST", json=body
+            )
             post_body = post_resp.json()[0]
             loss_set_id = int(post_body["lossSet"]["id"])
             file_guid = str(post_body["file"]["fileGUID"])
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reported per set, never raised
             return error_result(f"POST /api/LossSets failed: {exc}")
 
         try:
-            url_resp = session.post(
-                f"{base}:{port}/api/LossSets/{file_guid}/PresignedUploadUrl"
+            url_resp = client.request(
+                "loss",
+                f"/api/LossSets/{file_guid}/PresignedUploadUrl",
+                method="POST",
             )
-            url_resp.raise_for_status()
             presigned_url = str(url_resp.json()["url"])
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reported per set, never raised
             return error_result(
                 f"PresignedUploadUrl failed: {exc}",
                 loss_set_id=loss_set_id,
@@ -259,9 +261,10 @@ class LossGroup:
                 presigned_url,
                 data=queued.csv_bytes,
                 headers={"Content-Type": "text/csv"},
+                timeout=self._client.timeout,
             )
             put_resp.raise_for_status()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reported per set, never raised
             return error_result(
                 f"S3 PUT failed: {exc}",
                 loss_set_id=loss_set_id,
@@ -273,8 +276,7 @@ class LossGroup:
         status_id = _STATUS_SUBMIT
         while True:
             try:
-                info_resp = session.get(f"{base}:{port}/api/Files/FileByGuid/{file_guid}")
-                info_resp.raise_for_status()
+                info_resp = client.request("loss", f"/api/Files/FileByGuid/{file_guid}")
                 last_info = info_resp.json() or {}
                 status_id = int(last_info.get("uploadStatusId") or _STATUS_SUBMIT)
             except requests.HTTPError as exc:
@@ -288,7 +290,7 @@ class LossGroup:
                     )
                 last_info = {"statusMessage": f"poll error: {exc}"}
                 status_id = _STATUS_SUBMIT
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - a poll blip must not end the upload
                 last_info = {"statusMessage": f"poll error: {exc}"}
                 status_id = _STATUS_SUBMIT
 
@@ -300,7 +302,9 @@ class LossGroup:
                     status="timeout",
                     loss_set_id=loss_set_id,
                     file_guid=file_guid,
-                    status_message=str(last_info.get("statusMessage") or "poll timeout"),
+                    status_message=str(
+                        last_info.get("statusMessage") or "poll timeout"
+                    ),
                 )
             if poll_interval > 0:
                 time.sleep(poll_interval)
@@ -315,8 +319,12 @@ class LossGroup:
         )
 
     @staticmethod
-    def _build_loss_set_body(queued: "_QueuedLossSet", loss_set_group_id: int) -> Dict[str, Any]:
-        loss_type_id = _YELT_LOSS_TYPE_ID if queued.loss_type == "yelt" else _ELT_LOSS_TYPE_ID
+    def _build_loss_set_body(
+        queued: _QueuedLossSet, loss_set_group_id: int
+    ) -> dict[str, Any]:
+        loss_type_id = (
+            _YELT_LOSS_TYPE_ID if queued.loss_type == "yelt" else _ELT_LOSS_TYPE_ID
+        )
         return {
             "activeFlag": True,
             "lossTypeId": loss_type_id,
@@ -379,7 +387,9 @@ class LossGroup:
             csv_bytes=csv_bytes,
             currency_code=currency_code,
             event_set_id=self._resolve_id(event_set_id, "event_set", "get_event_set"),
-            perspective_id=self._resolve_id(perspective_id, "perspective", "get_perspective"),
+            perspective_id=self._resolve_id(
+                perspective_id, "perspective", "get_perspective"
+            ),
             variant_id=self._resolve_id(variant_id, "variant", "get_variant"),
             vendor_id=self._resolve_id(vendor_id, "vendor", "get_vendor"),
             sim_years=sim_years,

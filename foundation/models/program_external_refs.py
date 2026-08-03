@@ -1,7 +1,9 @@
 """Program External References - Access to program external system references"""
 
-from typing import Dict, List, Any, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
 from ..utils import camel_to_snake
+from ._init_helpers import raise_if_private
 
 if TYPE_CHECKING:
     from ..ref_data import ReferenceDataCache
@@ -10,7 +12,7 @@ if TYPE_CHECKING:
 class ExternalRef:
     """Represents a single external reference."""
 
-    def __init__(self, ref_data: Dict[str, Any], ref_cache: "ReferenceDataCache"):
+    def __init__(self, ref_data: dict[str, Any], ref_cache: "ReferenceDataCache"):
         """
         Initialize external reference.
 
@@ -22,27 +24,27 @@ class ExternalRef:
         self._ref_cache = ref_cache
 
     @property
-    def id(self) -> Optional[int]:
+    def id(self) -> int | None:
         """External reference ID."""
         return self._data.get("id")
 
     @property
-    def type_id(self) -> Optional[int]:
+    def type_id(self) -> int | None:
         """External reference type ID."""
         return self._data.get("externalRefTypeId")
 
     @property
-    def type_name(self) -> Optional[str]:
+    def type_name(self) -> str | None:
         """External reference type name (enriched from reference data)."""
         type_id = self.type_id
         if type_id:
             ref_type = self._ref_cache.get_external_ref_type(type_id)
             if ref_type:
-                return ref_type.get("name")
+                return ref_type.name
         return None
 
     @property
-    def value(self) -> Optional[str]:
+    def value(self) -> str | None:
         """External reference value."""
         return self._data.get("value")
 
@@ -54,16 +56,16 @@ class ExternalRef:
 class ProgramExternalRefs:
     """
     Provides access to program external references.
-    
+
     Example:
         >>> # Access all external refs
         >>> for ref in program.external_refs:
         ...     print(f"{ref.type_name}: {ref.value}")
-        
+
         >>> # Access by type name
         >>> program.external_refs.get_by_type("CRM Pro")
         'KGYALF'
-        
+
         >>> # Dot-style access (snake_case)
         >>> program.external_refs.crm_pro
         'KGYALF'
@@ -71,7 +73,9 @@ class ProgramExternalRefs:
         '934-646327'
     """
 
-    def __init__(self, external_refs: List[Dict[str, Any]], ref_cache: "ReferenceDataCache"):
+    def __init__(
+        self, external_refs: list[dict[str, Any]], ref_cache: "ReferenceDataCache"
+    ):
         """
         Initialize program external references.
 
@@ -81,15 +85,15 @@ class ProgramExternalRefs:
         """
         self._ref_cache = ref_cache
         self._refs = [ExternalRef(ref, ref_cache) for ref in external_refs]
-        
+
         # Build a map of snake_case type names to values for dot-style access
-        self._ref_map: Dict[str, Optional[str]] = {}
+        self._ref_map: dict[str, str | None] = {}
         for ref in self._refs:
             if ref.type_name:
                 snake_name = camel_to_snake(ref.type_name)
                 self._ref_map[snake_name] = ref.value
 
-    def get_by_type(self, type_name: str) -> Optional[str]:
+    def get_by_type(self, type_name: str) -> str | None:
         """
         Get external reference value by type name.
 
@@ -104,7 +108,7 @@ class ProgramExternalRefs:
                 return ref.value
         return None
 
-    def get_by_type_id(self, type_id: int) -> Optional[str]:
+    def get_by_type_id(self, type_id: int) -> str | None:
         """
         Get external reference value by type ID.
 
@@ -127,7 +131,7 @@ class ProgramExternalRefs:
         """Number of external references."""
         return len(self._refs)
 
-    def __getattr__(self, name: str) -> Optional[str]:
+    def __getattr__(self, name: str) -> str | None:
         """
         Dynamic attribute access for external references.
 
@@ -140,17 +144,16 @@ class ProgramExternalRefs:
         Raises:
             AttributeError: If external reference not found
         """
-        if name.startswith("_"):
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-        
+        raise_if_private(self, name)
+
         if name in self._ref_map:
             return self._ref_map[name]
-        
+
         raise AttributeError(
             f"'{self.__class__.__name__}' object has no attribute '{name}'"
         )
 
-    def __dir__(self) -> List[str]:
+    def __dir__(self) -> list[str]:
         """
         Return list of available attributes for autocomplete.
 
@@ -169,35 +172,35 @@ class ProgramExternalRefs:
     def describe(self) -> None:
         """
         Display a comprehensive overview of external references.
-        
+
         Shows all external system references with their types and values.
-        
+
         Example:
             >>> program.external_refs.describe()
         """
         print("=" * 80)
         print("EXTERNAL REFERENCES")
         print("=" * 80)
-        
+
         if not self._refs:
             print("\n(no external references)")
             print("\n" + "=" * 80 + "\n")
             return
-        
+
         print(f"\n{'System Type':<35} {'Snake Case Access':<25} {'Value':<20}")
-        print(f"{'-'*35} {'-'*25} {'-'*20}")
-        
+        print(f"{'-' * 35} {'-' * 25} {'-' * 20}")
+
         for ref in self._refs:
             type_name = ref.type_name or "(unknown)"
             snake_name = camel_to_snake(ref.type_name) if ref.type_name else ""
             value = ref.value or ""
             value_str = value[:18] if len(value) <= 18 else value[:15] + "..."
             print(f"{type_name:<35} {snake_name:<25} {value_str:<20}")
-        
+
         print("\nACCESS METHODS:")
         print("  • Dot notation: external_refs.<snake_case_name>")
         print("  • By type name: external_refs.get_by_type('Type Name')")
         print("  • By type ID: external_refs.get_by_type_id(id)")
         print("  • Iterate: for ref in external_refs: ...")
-        
+
         print("\n" + "=" * 80 + "\n")

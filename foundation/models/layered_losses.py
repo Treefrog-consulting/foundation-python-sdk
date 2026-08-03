@@ -68,11 +68,6 @@ class LayeredLosses(_LossExportAccessor):
         query = con.execute(_LAYERED_LOSSES_SELECT, [self._layer.id])
         return getattr(query, format_method)()
 
-    def __dir__(self):
-        attrs = set(super().__dir__())
-        attrs.update(["as_polars", "as_pandas", "describe", "__call__"])
-        return sorted(attrs)
-
     def describe(self) -> None:
         """Display a summary of this LayeredLosses accessor.
 
@@ -83,7 +78,7 @@ class LayeredLosses(_LossExportAccessor):
         print("LAYERED LOSSES")
         print("=" * 60)
         print(f"  Layer: {self._layer.name} (id={self._layer.id})")
-        print(f"  Cached configs: {len(self._cache)}")
+        print(f"  Cached exports (deal-wide): {self._cached_export_count()}")
         print()
         print("USAGE:")
         print("  layer.layered_losses(run_config)  -> polars.DataFrame (default)")

@@ -1,19 +1,22 @@
 """Collection for stored run configurations."""
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import Any
 
+from ._frames import RecordFrames
 from .run_configuration import RunConfiguration
 
-if TYPE_CHECKING:
-    import pandas as pd
 
-
-class RunConfigurations:
+class RunConfigurations(RecordFrames):
     """Collection of run configurations for a program.
 
     Provides access to pre-configured analyses that have been saved in
     the Foundation Platform. These are loaded automatically when retrieving
     a program and can be accessed by label.
+
+    ``as_pandas()`` / ``as_polars()`` give a tabular view of all stored run
+    configurations with their key parameters, in columns: label, sim_years,
+    vendor_id, currency_code, variant_id, event_set_id, perspective_id,
+    participant_id, analysis_type.
 
     Example:
         >>> # Access all configurations
@@ -24,9 +27,14 @@ class RunConfigurations:
         >>> config = program.run_configurations.get_by_label("Default")
         >>> if config:
         ...     losses = layer.layered_losses.as_polars(config)
+
+        >>> # Tabular view of every configuration
+        >>> df = program.run_configurations.as_pandas()
+        >>> print(df)
+        >>> df = program.run_configurations.as_polars()
     """
 
-    def __init__(self, analyses_data: List[Dict[str, Any]]):
+    def __init__(self, analyses_data: list[dict[str, Any]]):
         """Initialize collection from API response.
 
         Args:
@@ -36,7 +44,7 @@ class RunConfigurations:
             RunConfiguration.from_dict(data) for data in analyses_data
         ]
 
-    def get_by_label(self, label: str) -> Optional[RunConfiguration]:
+    def get_by_label(self, label: str) -> RunConfiguration | None:
         """Get a run configuration by its label.
 
         Args:
@@ -75,60 +83,21 @@ class RunConfigurations:
         """
         return self._configurations[index]
 
-    def as_pandas(self) -> "pd.DataFrame":
-        """Get run configurations as a pandas DataFrame.
-
-        Returns a tabular view of all stored run configurations with
-        their key parameters.
-
-        Returns:
-            pandas DataFrame with columns: label, sim_years, vendor_id,
-                currency_code, variant_id, event_set_id, perspective_id,
-                participant_id, analysis_type
-
-        Raises:
-            ImportError: If pandas is not installed.
-
-        Example:
-            >>> df = program.run_configurations.as_pandas()
-            >>> print(df)
-        """
-        try:
-            import pandas as pd
-        except ImportError:
-            raise ImportError(
-                "pandas is required to use as_pandas(). "
-                "Install it with: pip install pandas"
-            )
-
-        records = []
-        for c in self._configurations:
-            records.append(
-                {
-                    "label": c.label,
-                    "sim_years": c.sim_years,
-                    "vendor_id": c.vendor_id,
-                    "currency_code": c.currency_code,
-                    "variant_id": c.variant_id,
-                    "event_set_id": c.event_set_id,
-                    "perspective_id": c.perspective_id,
-                    "participant_id": c.participant_id,
-                    "analysis_type": c.analysis_type,
-                }
-            )
-        return pd.DataFrame(records)
-
-    def __dir__(self):
-        """Return list of available attributes for autocomplete."""
-        attrs = set(super().__dir__())
-        attrs.update(
-            [
-                "get_by_label",
-                "as_pandas",
-                "describe",
-            ]
-        )
-        return sorted(attrs)
+    def _to_records(self) -> list[dict]:
+        return [
+            {
+                "label": c.label,
+                "sim_years": c.sim_years,
+                "vendor_id": c.vendor_id,
+                "currency_code": c.currency_code,
+                "variant_id": c.variant_id,
+                "event_set_id": c.event_set_id,
+                "perspective_id": c.perspective_id,
+                "participant_id": c.participant_id,
+                "analysis_type": c.analysis_type,
+            }
+            for c in self._configurations
+        ]
 
     def describe(self) -> None:
         """Display a summary of available run configurations.
@@ -147,14 +116,15 @@ class RunConfigurations:
         for c in self._configurations:
             label = c.label or "(unlabeled)"
             print(
-                f"  {str(label)[:23]:<25} {str(c.sim_years):<12} "
-                f"{str(c.vendor_id):<10} {str(c.currency_code):<10} "
-                f"{str(c.analysis_type):<10}"
+                f"  {str(label)[:23]:<25} {c.sim_years!s:<12} "
+                f"{c.vendor_id!s:<10} {c.currency_code!s:<10} "
+                f"{c.analysis_type!s:<10}"
             )
         print()
         print("METHODS:")
         print("  get_by_label(label) -> RunConfiguration")
         print("  as_pandas()         -> pandas.DataFrame")
+        print("  as_polars()         -> polars.DataFrame")
         print("=" * 80)
         print()
 

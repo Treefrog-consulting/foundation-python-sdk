@@ -1,21 +1,25 @@
 """Collection for reference runs from the Deal Module."""
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
+from ._frames import RecordFrames
 from .reference_run import ReferenceRun
 
 if TYPE_CHECKING:
-    import pandas as pd
-
     from ..ref_data import ReferenceDataCache
 
 
-class ReferenceRuns:
+class ReferenceRuns(RecordFrames):
     """Collection of reference runs from the Deal Module.
 
     Reference runs are pre-stored run configurations that are loaded once
     when the client authenticates and cached for the session. Only active
     reference runs (activeFlag=True) are included.
+
+    ``as_pandas()`` / ``as_polars()`` give a tabular view of all active
+    reference runs with their key configuration parameters, in columns: id,
+    name, description, vendor_id, variant_id, perspective_id, sim_years,
+    event_set_id, model_view_id, preference_group, preference_order.
 
     Example:
         >>> # Access all reference runs
@@ -30,11 +34,16 @@ class ReferenceRuns:
 
         >>> # Get by ID
         >>> ref_run = client.reference_runs.get_by_id(1)
+
+        >>> # Tabular view of every active reference run
+        >>> df = client.reference_runs.as_pandas()
+        >>> print(df)
+        >>> df = client.reference_runs.as_polars()
     """
 
     def __init__(
         self,
-        reference_runs_data: List[Dict[str, Any]],
+        reference_runs_data: list[dict[str, Any]],
         ref_cache: Optional["ReferenceDataCache"] = None,
     ):
         """Initialize collection from API response.
@@ -51,7 +60,7 @@ class ReferenceRuns:
         self._reference_runs = [
             ReferenceRun.from_dict(data, ref_cache)
             for data in reference_runs_data
-            if data.get("activeFlag", False)
+            if data.get("activeFlag")
         ]
         # Sort by preference group and preference order
         self._reference_runs.sort(
@@ -62,7 +71,7 @@ class ReferenceRuns:
         # Index by name (case-insensitive) for quick lookup
         self._by_name = {r.name.lower(): r for r in self._reference_runs}
 
-    def get_by_name(self, name: str) -> Optional[ReferenceRun]:
+    def get_by_name(self, name: str) -> ReferenceRun | None:
         """Get a reference run by its name.
 
         Args:
@@ -79,7 +88,7 @@ class ReferenceRuns:
         """
         return self._by_name.get(name.lower())
 
-    def get_by_id(self, id: int) -> Optional[ReferenceRun]:
+    def get_by_id(self, id: int) -> ReferenceRun | None:
         """Get a reference run by its ID.
 
         Args:
@@ -114,67 +123,32 @@ class ReferenceRuns:
         """
         return self._reference_runs[index]
 
-    def as_pandas(self) -> "pd.DataFrame":
-        """Get reference runs as a pandas DataFrame.
-
-        Returns a tabular view of all active reference runs with their
-        key configuration parameters.
-
-        Returns:
-            pandas DataFrame with columns: id, name, description,
-                vendor_id, variant_id, perspective_id, sim_years,
-                event_set_id, model_view_id, preference_group,
-                preference_order
-
-        Raises:
-            ImportError: If pandas is not installed.
-
-        Example:
-            >>> df = client.reference_runs.as_pandas()
-            >>> print(df)
-        """
-        try:
-            import pandas as pd
-        except ImportError:
-            raise ImportError(
-                "pandas is required to use as_pandas(). "
-                "Install it with: pip install pandas"
-            )
-
-        records = []
-        for r in self._reference_runs:
-            records.append(
-                {
-                    "id": r.id,
-                    "name": r.name,
-                    "description": r.description,
-                    "vendor_id": r.vendor_id,
-                    "variant_id": r.variant_id,
-                    "perspective_id": r.perspective_id,
-                    "sim_years": r.sim_years,
-                    "event_set_id": r.event_set_id,
-                    "model_view_id": r.model_view_id,
-                    "preference_group": r.preference_group,
-                    "preference_order": r.preference_order,
-                }
-            )
-        return pd.DataFrame(records)
+    def _to_records(self) -> list[dict]:
+        return [
+            {
+                "id": r.id,
+                "name": r.name,
+                "description": r.description,
+                "vendor_id": r.vendor_id,
+                "variant_id": r.variant_id,
+                "perspective_id": r.perspective_id,
+                "sim_years": r.sim_years,
+                "event_set_id": r.event_set_id,
+                "model_view_id": r.model_view_id,
+                "preference_group": r.preference_group,
+                "preference_order": r.preference_order,
+            }
+            for r in self._reference_runs
+        ]
 
     def __dir__(self):
-        """Return list of available attributes for autocomplete."""
-        attrs = set(super().__dir__())
-        attrs.update(
-            [
-                "get_by_name",
-                "get_by_id",
-                "as_pandas",
-                "describe",
-            ]
-        )
+        """Autocomplete over the real methods plus the runs' names.
+
+        super() already lists everything defined on the class, so naming the
+        methods again only creates a second list to keep in step.
+        """
         # Add reference run names for tab-completion awareness
-        for r in self._reference_runs:
-            attrs.add(r.name)
-        return sorted(attrs)
+        return sorted(set(super().__dir__()) | {r.name for r in self._reference_runs})
 
     def describe(self) -> None:
         """Display a summary of available reference runs.
@@ -192,15 +166,16 @@ class ReferenceRuns:
         print(f"  {'-' * 6} {'-' * 30} {'-' * 12} {'-' * 10} {'-' * 8} {'-' * 8}")
         for r in self._reference_runs:
             print(
-                f"  {str(r.id):<6} {str(r.name)[:28]:<30} "
-                f"{str(r.sim_years):<12} {str(r.vendor_id):<10} "
-                f"{str(r.preference_group):<8} {str(r.preference_order):<8}"
+                f"  {r.id!s:<6} {str(r.name)[:28]:<30} "
+                f"{r.sim_years!s:<12} {r.vendor_id!s:<10} "
+                f"{r.preference_group!s:<8} {r.preference_order!s:<8}"
             )
         print()
         print("METHODS:")
         print("  get_by_name(name)  -> ReferenceRun")
         print("  get_by_id(id)      -> ReferenceRun")
         print("  as_pandas()        -> pandas.DataFrame")
+        print("  as_polars()        -> polars.DataFrame")
         print("=" * 80)
         print()
 

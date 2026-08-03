@@ -1,25 +1,29 @@
 """Collection classes"""
 
 from typing import (
-    Union,
-    TypeVar,
-    Generic,
-    overload,
-    Optional,
-    TYPE_CHECKING,
     Any,
-    Dict,
-    List,
+    overload,
 )
 
-T = TypeVar("T")
-
-if TYPE_CHECKING:
-    import pandas as pd
+from ._frames import RecordFrames
 
 
-class NamedCollection(list, Generic[T]):
-    """A list that supports indexing by name attribute."""
+class NamedCollection[T](RecordFrames, list):
+    """A list that supports indexing by name attribute.
+
+    ``as_pandas()`` / ``as_polars()`` introspect the contained objects' public
+    properties to build a tabular representation, so they work with any
+    contained type that has properties (Layer, ProgramBroker, LayerParticipant,
+    Reinstatement, etc.). One row per item; the columns are the items' public
+    property names, private and internal attributes excluded.
+
+    Example:
+        >>> df = program.layers.as_pandas()
+        >>> df = program.brokers.as_pandas()
+        >>> df = layer.participants.as_pandas()
+        >>> df = layer.reinstatements.as_pandas()
+        >>> df = program.layers.as_polars()
+    """
 
     @overload
     def __getitem__(self, key: int) -> T: ...
@@ -27,22 +31,41 @@ class NamedCollection(list, Generic[T]):
     @overload
     def __getitem__(self, key: str) -> T: ...
 
-    def __getitem__(self, key: Union[int, str]) -> T:
-        """Get item by index or by name."""
+    @overload
+    def __getitem__(self, key: slice) -> "NamedCollection[T]": ...
+
+    def __getitem__(self, key: int | str | slice) -> "T | NamedCollection[T]":
+        """Get an item by index or name, or a sub-collection by slice."""
+        if isinstance(key, slice):
+            # A slice used to reach the TypeError below, so program.layers[:3]
+            # failed on a type that subclasses list. Return the same class so
+            # the slice keeps name lookup and the frame accessors.
+            return type(self)(super().__getitem__(key))
         if isinstance(key, int):
             return super().__getitem__(key)
-        elif isinstance(key, str):
+        if isinstance(key, str):
             # Search for item with matching name
             for item in self:
-                if hasattr(item, "name") and item.name == key:
+                if getattr(item, "name", None) == key:
                     return item
             raise KeyError(f"No item found with name '{key}'")
-        else:
-            raise TypeError(
-                f"Indices must be integers or strings, not {type(key).__name__}"
-            )
+        raise TypeError(
+            f"Indices must be integers, strings or slices, not {type(key).__name__}"
+        )
 
-    def get_by_id(self, item_id: int) -> T:
+    def __contains__(self, item: object) -> bool:
+        """Membership by name as well as by identity.
+
+        ``coll["Layer A"]`` resolved a name while ``"Layer A" in coll`` was
+        False, because list compares the string against the objects.
+        """
+        if super().__contains__(item):
+            return True
+        return isinstance(item, str) and any(
+            getattr(i, "name", None) == item for i in self
+        )
+
+    def get_by_id(self, item_id: int) -> T | None:
         """
         Get item by its ID attribute.
 
@@ -50,49 +73,43 @@ class NamedCollection(list, Generic[T]):
             item_id: The ID of the item to find
 
         Returns:
-            The item with matching ID
-
-        Raises:
-            KeyError: If no item with the specified ID is found
+            The item with matching ID, or None if there is none. Every other
+            get_by_* in the SDK returns None on a miss; this one raised
+            KeyError until 0.12.
 
         Example:
             >>> layer = program.layers.get_by_id(1234)
         """
         for item in self:
-            if hasattr(item, "id") and item.id == item_id:
+            if getattr(item, "id", None) == item_id:
                 return item
-        raise KeyError(f"No item found with id={item_id}")
+        return None
 
-    def as_pandas(self) -> "pd.DataFrame":
-        """Convert collection items to a pandas DataFrame.
+    def get_by_name(self, name: str) -> T | None:
+        """
+        Get item by its name attribute, case-insensitively.
 
-        Introspects the contained objects' public properties and creates
-        a tabular representation. Works with any contained type that has
-        properties (Layer, ProgramBroker, LayerParticipant, Reinstatement, etc.).
+        Args:
+            name: The name of the item to find
 
         Returns:
-            pandas DataFrame with one row per item. Columns are derived from
-            the items' public properties (excluding private/internal attributes).
-
-        Raises:
-            ImportError: If pandas is not installed.
+            The matching item, or None if there is none. Use ``coll[name]`` to
+            raise KeyError instead.
 
         Example:
-            >>> df = program.layers.as_pandas()
-            >>> df = program.brokers.as_pandas()
-            >>> df = layer.participants.as_pandas()
-            >>> df = layer.reinstatements.as_pandas()
+            >>> layer = program.layers.get_by_name("Layer 1")
         """
-        try:
-            import pandas as pd
-        except ImportError:
-            raise ImportError(
-                "pandas is required to use as_pandas(). "
-                "Install it with: pip install pandas"
-            )
+        folded = name.casefold()
+        for item in self:
+            item_name = getattr(item, "name", None)
+            if item_name is not None and item_name.casefold() == folded:
+                return item
+        return None
 
+    def _to_records(self) -> list[dict[str, Any]]:
+        """One dict per item, keyed by the items' public property names."""
         if not self:
-            return pd.DataFrame()
+            return []
 
         # Extract property names from the first item's class
         first = self[0]
@@ -115,39 +132,32 @@ class NamedCollection(list, Generic[T]):
         priority = {"id": 0, "name": 1}
         prop_names.sort(key=lambda n: (priority.get(n, 2), n))
 
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
         for item in self:
-            row: Dict[str, Any] = {}
+            row: dict[str, Any] = {}
             for prop in prop_names:
                 try:
                     val = getattr(item, prop)
-                    # Skip callable methods and complex objects
-                    if callable(val) and not isinstance(
-                        getattr(item_type, prop, None), property
-                    ):
+                    if callable(val):
                         continue
-                    # For reference objects (Broker, Participant, etc.), use string representation
-                    if hasattr(val, "__dict__") and not isinstance(
-                        val, (str, int, float, bool, type(None))
-                    ):
-                        row[prop] = str(val)
-                    else:
-                        row[prop] = val
-                except Exception:
+                    # A model object (Broker, Participant, ...) is not a scalar
+                    # a frame can hold; no builtin scalar carries __dict__.
+                    row[prop] = str(val) if hasattr(val, "__dict__") else val
+                except Exception:  # noqa: BLE001 - reflection over arbitrary properties
                     row[prop] = None
             records.append(row)
 
-        return pd.DataFrame(records)
+        return records
 
     def __dir__(self):
-        """Return list of available attributes for autocomplete."""
-        attrs = set(super().__dir__())
-        attrs.update(["get_by_id", "as_pandas", "describe"])
-        # Add item names for tab-completion awareness
-        for item in self:
-            if hasattr(item, "name") and item.name:
-                attrs.add(item.name)
-        return sorted(attrs)
+        """Autocomplete over the real methods plus the items' names.
+
+        super() already lists everything defined on the class, so naming the
+        methods again only creates a second list to keep in step.
+        """
+        return sorted(
+            set(super().__dir__()) | {i.name for i in self if getattr(i, "name", None)}
+        )
 
     def describe(self) -> None:
         """Display a summary of collection contents.
@@ -179,8 +189,10 @@ class NamedCollection(list, Generic[T]):
 
         print()
         print("METHODS:")
-        print("  get_by_id(id)  -> item")
-        print("  as_pandas()    -> pandas.DataFrame")
+        print("  get_by_id(id)    -> item | None")
+        print("  get_by_name(nm)  -> item | None")
+        print("  as_pandas()      -> pandas.DataFrame")
+        print("  as_polars()      -> polars.DataFrame")
         print("  [index]        -> item by index")
         print("  ['name']       -> item by name")
         print("=" * 60)

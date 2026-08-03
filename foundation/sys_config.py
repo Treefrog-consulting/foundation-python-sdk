@@ -10,8 +10,8 @@ the canonical output-header name.
 from __future__ import annotations
 
 import warnings
-from typing import Iterable, List, Literal
-
+from collections.abc import Iterable
+from typing import Literal
 
 LossType = Literal["yelt", "elt"]
 
@@ -45,11 +45,23 @@ class SysConfigCache:
             for e in raw_entries
             if e.get("name")
         }
-        self._yelt_aliases: list[list[str]] = [_parse_aliases(by_key.get(k, "")) for k in _YELT_KEYS_IN_ORDER]
-        self._elt_aliases: list[list[str]] = [_parse_aliases(by_key.get(k, "")) for k in _ELT_KEYS_IN_ORDER]
+        self._yelt_aliases: list[list[str]] = [
+            _parse_aliases(by_key.get(k, "")) for k in _YELT_KEYS_IN_ORDER
+        ]
+        self._elt_aliases: list[list[str]] = [
+            _parse_aliases(by_key.get(k, "")) for k in _ELT_KEYS_IN_ORDER
+        ]
 
-        missing_yelt = [k for k, v in zip(_YELT_KEYS_IN_ORDER, self._yelt_aliases) if not v]
-        missing_elt = [k for k, v in zip(_ELT_KEYS_IN_ORDER, self._elt_aliases) if not v]
+        missing_yelt = [
+            k
+            for k, v in zip(_YELT_KEYS_IN_ORDER, self._yelt_aliases, strict=True)
+            if not v
+        ]
+        missing_elt = [
+            k
+            for k, v in zip(_ELT_KEYS_IN_ORDER, self._elt_aliases, strict=True)
+            if not v
+        ]
         if missing_yelt:
             warnings.warn(
                 f"SysConfig missing YELT alias keys: {missing_yelt}; "
@@ -79,9 +91,11 @@ class SysConfigCache:
     def missing_keys(self, loss_type: LossType) -> list[str]:
         keys = _YELT_KEYS_IN_ORDER if loss_type == "yelt" else _ELT_KEYS_IN_ORDER
         values = self._aliases_or_empty(loss_type)
-        return [k for k, v in zip(keys, values) if not v]
+        return [k for k, v in zip(keys, values, strict=True) if not v]
 
-    def missing_columns(self, loss_type: LossType, user_columns: Iterable[str]) -> list[str]:
+    def missing_columns(
+        self, loss_type: LossType, user_columns: Iterable[str]
+    ) -> list[str]:
         expected = self._aliases_or_empty(loss_type)
         user_fold = {c.casefold() for c in user_columns}
         return [
@@ -90,7 +104,9 @@ class SysConfigCache:
             if aliases and not any(a.casefold() in user_fold for a in aliases)
         ]
 
-    def duplicate_columns(self, loss_type: LossType, user_columns: Iterable[str]) -> list[str]:
+    def duplicate_columns(
+        self, loss_type: LossType, user_columns: Iterable[str]
+    ) -> list[str]:
         """Return canonical-column names for which the user's DataFrame has two
         columns matching (case-insensitive) the same alias slot."""
         expected = self._aliases_or_empty(loss_type)

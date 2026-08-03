@@ -5,10 +5,11 @@ They provide a convenient way to run loss analysis without manually specifying a
 """
 
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from ..ref_data import ReferenceDataCache
+    from .run_configuration import RunConfiguration
 
 
 class ReferenceRun:
@@ -48,7 +49,7 @@ class ReferenceRun:
         self,
         id: int,
         name: str,
-        description: Optional[str],
+        description: str | None,
         vendor_id: int,
         variant_id: int,
         perspective_id: int,
@@ -93,7 +94,7 @@ class ReferenceRun:
 
     @classmethod
     def from_dict(
-        cls, data: Dict[str, Any], ref_cache: Optional["ReferenceDataCache"] = None
+        cls, data: dict[str, Any], ref_cache: Optional["ReferenceDataCache"] = None
     ) -> "ReferenceRun":
         """Create a ReferenceRun from API response data.
 
@@ -116,23 +117,23 @@ class ReferenceRun:
             model_view_id=data.get("modelViewId"),
             preference_group=data.get("preferenceGroup"),
             preference_order=data.get("preferenceOrder"),
-            active_flag=data.get("activeFlag", False),
+            active_flag=data.get("activeFlag"),
             ref_cache=ref_cache,
         )
 
     def to_run_configuration(
         self,
         currency_code: str = "USD",
-        participant_id: Optional[int] = None,
-        model_ids: Optional[List[int]] = None,
+        participant_id: int | None = None,
+        model_ids: list[int] | None = None,
         analysis_type: int = 1,
-        event_split_view_id: Optional[int] = None,
-        apply_loss_splits_flag: Optional[bool] = None,
-        as_of_date: Optional[datetime] = None,
-        claim_amount: Optional[str] = None,
-        historical_flag: Optional[bool] = None,
-        event_list: Optional[List[int]] = None,
-        claims_history_values: Optional[Dict[str, Any]] = None,
+        event_split_view_id: int | None = None,
+        apply_loss_splits_flag: bool | None = None,
+        as_of_date: datetime | None = None,
+        claim_amount: str | None = None,
+        historical_flag: bool | None = None,
+        event_list: list[int] | None = None,
+        claims_history_values: dict[str, Any] | None = None,
     ) -> "RunConfiguration":
         """Convert this reference run to a RunConfiguration.
 

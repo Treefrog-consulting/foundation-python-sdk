@@ -4,18 +4,17 @@ and reordering against a canonical column list."""
 from __future__ import annotations
 
 import io
-from typing import Any, Iterable, List, Mapping, Optional, Sequence, Union
-
-import pandas as pd
-import polars as pl
+import sys
+from collections.abc import Iterable, Mapping, Sequence
+from typing import Any
 
 from .exceptions import LossSetValidationError
+from .utils import require
+
+ColumnSpec = str | Sequence[str]
 
 
-ColumnSpec = Union[str, Sequence[str]]
-
-
-def _normalize_spec(spec: ColumnSpec) -> List[str]:
+def _normalize_spec(spec: ColumnSpec) -> list[str]:
     """Accept either a single canonical name or a list of aliases for one slot."""
     if isinstance(spec, str):
         return [spec]
@@ -25,10 +24,36 @@ def _normalize_spec(spec: ColumnSpec) -> List[str]:
     return list(aliases)
 
 
+def _to_pandas(data: Any) -> Any:
+    """Return ``data`` as a pandas DataFrame, whichever library produced it.
+
+    Only the library the caller already used is imported. Importing both to run
+    two isinstance checks made pandas and polars unavoidable for anyone who
+    merely imported the package.
+    """
+    pandas = sys.modules.get("pandas")
+    if pandas is not None and isinstance(data, pandas.DataFrame):
+        return data
+
+    polars = sys.modules.get("polars")
+    if polars is not None and isinstance(data, polars.DataFrame):
+        # to_pandas() needs pandas and pyarrow; name them rather than let the
+        # ImportError surface from inside polars.
+        require("pandas", "add_yelt/add_elt with a polars DataFrame")
+        require("pyarrow", "add_yelt/add_elt with a polars DataFrame")
+        return data.to_pandas()
+
+    # A frame can only exist if its library is imported, so reaching here means
+    # the value is not one.
+    raise LossSetValidationError(
+        f"data must be a pandas or polars DataFrame, got {type(data).__name__}"
+    )
+
+
 def build_csv(
     data: Any,
     canonical_columns: Iterable[ColumnSpec],
-    column_map: Optional[Mapping[str, str]] = None,
+    column_map: Mapping[str, str] | None = None,
 ) -> bytes:
     """Validate required columns, reorder / rename, and emit CSV bytes.
 
@@ -40,15 +65,8 @@ def build_csv(
     - Duplicate columns under case-fold raise — there's no unambiguous source.
     - Optional column_map renames source columns before matching.
     """
-    slots: List[List[str]] = [_normalize_spec(spec) for spec in canonical_columns]
-    if isinstance(data, pd.DataFrame):
-        frame = data
-    elif isinstance(data, pl.DataFrame):
-        frame = data.to_pandas()
-    else:
-        raise LossSetValidationError(
-            f"data must be a pandas or polars DataFrame, got {type(data).__name__}"
-        )
+    slots: list[list[str]] = [_normalize_spec(spec) for spec in canonical_columns]
+    frame = _to_pandas(data)
 
     if column_map:
         unknown = [src for src in column_map if src not in frame.columns]

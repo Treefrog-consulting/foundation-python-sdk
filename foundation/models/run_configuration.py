@@ -1,7 +1,29 @@
 """Run configuration for loss export."""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any
+
+
+def _freeze(value: Any) -> Any:
+    """Return a hashable stand-in for an arbitrarily nested payload.
+
+    claims_history_values is a free-form dict, and the previous one-level
+    conversion raised "unhashable type: dict" on a nested one -- from inside
+    the export cache key, so passing a documented argument broke every
+    layered_losses, ylt and metric_results read.
+    """
+    if isinstance(value, dict):
+        # Ordered by a stable string form: claims_history_values is free-form,
+        # and comparing an int key against a str one raises.
+        return tuple(
+            sorted(
+                ((k, _freeze(v)) for k, v in value.items()),
+                key=lambda kv: repr(kv[0]),
+            )
+        )
+    if isinstance(value, list):
+        return tuple(_freeze(v) for v in value)
+    return value
 
 
 class RunConfiguration:
@@ -10,34 +32,49 @@ class RunConfiguration:
     This class encapsulates all the parameters needed to run a loss analysis
     and export layered losses and YLT data.
 
+    Every argument is keyword-only, and the nine through ``analysis_type`` are
+    required: six of them are bare ints, so a positional call could transpose
+    two and export a different analysis without any error.
+
     Example:
         >>> config = RunConfiguration(
         ...     sim_years=10000,
         ...     vendor_id=1,
-        ...     currency_code="USD"
+        ...     currency_code="USD",
+        ...     variant_id=1,
+        ...     event_set_id=5,
+        ...     perspective_id=1,
+        ...     participant_id=None,   # None means every participant
+        ...     model_ids=[],          # empty means every model
+        ...     analysis_type=1,       # 1=Stochastic, 2=Blended, 3=Claims only
         ... )
         >>> losses_df = layer.layered_losses.as_polars(config)
+
+    Prefer a stored configuration where one exists:
+
+        >>> config = program.run_configurations.get_by_label("Default")
     """
 
     def __init__(
         self,
+        *,
         sim_years: int,
         vendor_id: int,
         currency_code: str,
-        variant_id: Optional[int],
-        event_set_id: Optional[int],
-        perspective_id: Optional[int],
-        participant_id: Optional[int],
-        model_ids: List[int],
-        analysis_type: Optional[int],
-        event_split_view_id: Optional[int] = None,
-        apply_loss_splits_flag: Optional[bool] = None,
-        as_of_date: Optional[datetime] = None,
-        claim_amount: Optional[str] = None,
-        historical_flag: Optional[bool] = None,
-        event_list: Optional[List[int]] = None,
-        claims_history_values: Optional[Dict[str, Any]] = None,
-        label: Optional[str] = None,
+        variant_id: int | None,
+        event_set_id: int | None,
+        perspective_id: int | None,
+        participant_id: int | None,
+        model_ids: list[int],
+        analysis_type: int | None,
+        event_split_view_id: int | None = None,
+        apply_loss_splits_flag: bool | None = None,
+        as_of_date: datetime | None = None,
+        claim_amount: str | None = None,
+        historical_flag: bool | None = None,
+        event_list: list[int] | None = None,
+        claims_history_values: dict[str, Any] | None = None,
+        label: str | None = None,
     ):
         """Initialize run configuration.
 
@@ -79,7 +116,7 @@ class RunConfiguration:
         self.label = label
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "RunConfiguration":
+    def from_dict(cls, data: dict[str, Any]) -> "RunConfiguration":
         """Create a RunConfiguration from API response data.
 
         Args:
@@ -108,7 +145,7 @@ class RunConfiguration:
             label=data.get("label"),
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert configuration to dictionary for API request.
 
         Returns:
@@ -153,16 +190,7 @@ class RunConfiguration:
         Returns:
             Hash value based on configuration parameters.
         """
-        # Convert dict to tuple of sorted items for hashing
-        items = []
-        for key, value in sorted(self.to_dict().items()):
-            if isinstance(value, list):
-                items.append((key, tuple(value) if value else None))
-            elif isinstance(value, dict):
-                items.append((key, tuple(sorted(value.items())) if value else None))
-            else:
-                items.append((key, value))
-        return hash(tuple(items))
+        return hash(_freeze(self.to_dict()))
 
     def __dir__(self):
         """Return list of available attributes for autocomplete."""

@@ -1,6 +1,5 @@
 """Category detail reference data model"""
 
-from typing import Optional
 from .base import BaseModel
 
 
@@ -8,21 +7,21 @@ class CategoryDetail(BaseModel):
     """Category detail reference data model."""
 
     @property
-    def category_id(self) -> Optional[int]:
+    def category_id(self) -> int | None:
         """Category ID."""
         return self._data.get("categoryId")
 
     @property
-    def code(self) -> Optional[str]:
+    def code(self) -> str | None:
         """Category detail code."""
         return self._data.get("code")
 
     @property
-    def sort_order(self) -> Optional[int]:
+    def sort_order(self) -> int | None:
         """Sort order."""
         return self._data.get("sortOrder")
 
     @property
-    def active_flag(self) -> bool:
+    def active_flag(self) -> bool | None:
         """Whether the category detail is active."""
-        return self._data.get("activeFlag", False)
+        return self._data.get("activeFlag")

@@ -1,24 +1,46 @@
 """Foundation Platform API Client"""
 
+import copy
 import warnings
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
+from urllib.parse import quote
 
 import requests
 
+from ..exceptions import raise_for_status
 from ..sys_config import SysConfigCache
-from ..utils import camel_to_snake
+from ..utils import camel_to_snake, ref_values
+from ._init_helpers import raise_if_private
+from ._reference_tables import REFERENCE_TABLES
 
 if TYPE_CHECKING:
     from ..ref_data import ReferenceDataCache
+    from .broker import Broker
+    from .broker_office import BrokerOffice
+    from .category import Category
+    from .category_detail import CategoryDetail
     from .client import Client
+    from .currency import Currency
+    from .custom_field import CustomField
     from .event_set import EventSet
+    from .external_ref_type import ExternalRefType
+    from .layer import Layer
+    from .layer_limit_attach_type import LayerLimitAttachType
+    from .layer_order_term_type import LayerOrderTermType
+    from .layer_premium_type import LayerPremiumType
+    from .layer_status import LayerStatus
     from .module_custom_table import ModuleCustomTable
     from .participant import Participant
+    from .participant_status import ParticipantStatus
     from .peril import Peril
     from .perspective import Perspective
     from .program import Program
+    from .program_versions import ProgramVersions
     from .reference_runs import ReferenceRuns
+    from .reference_table import ReferenceTable
     from .region import Region
+    from .reinst_prem_base import ReinstPremBase
+    from .unit_of_measure import UnitOfMeasure
     from .variant import Variant
     from .vendor import Vendor
 
@@ -26,40 +48,62 @@ if TYPE_CHECKING:
 class FoundationClient:
     """Client for interacting with the Foundation Platform API."""
 
-    PORTS = {
+    PORTS: ClassVar[dict[str, int]] = {
         "identity": 5000,
         "deal": 5001,
         "loss": 5002,
         "common": 5003,
         "metrics": 5005,
         "portfolio": 5006,
-        "admin": 5010,
     }
 
-    def __init__(self, base_url: str):
+    #: Seconds a socket may stall before a request is abandoned. requests
+    #: applies this to the connection and to each wait for more bytes, so it
+    #: does not cap a transfer's total duration -- a large upload that keeps
+    #: sending is never cut off, while a server that stops responding is.
+    DEFAULT_TIMEOUT = 30.0
+
+    def __init__(self, base_url: str, timeout: float | None = DEFAULT_TIMEOUT):
         """
         Initialize the Foundation Platform client.
 
         Args:
             base_url: Base URL for the API (without port), e.g., "https://your-instance.foundationplatform.com"
+            timeout: Per-socket timeout in seconds for every request this client
+                makes. None waits forever, which is what every version before
+                0.12 did.
         """
         self.base_url = base_url.rstrip("/")
-        self._token: Optional[str] = None
-        self._ref_cache: Optional["ReferenceDataCache"] = None
-        self._layer_headers: Dict[int, int] = {}  # layer_id -> program_id mapping
+        self.timeout = timeout
+        self._token: str | None = None
+        self._ref_cache: ReferenceDataCache | None = None
+        self._layer_headers: dict[int, int] = {}  # layer_id -> program_id mapping
         self._session = requests.Session()
-        self._module_custom_tables: Dict[
-            str, "ModuleCustomTable"
+        self._module_custom_tables: dict[
+            str, ModuleCustomTable
         ] = {}  # snake_name -> table
-        self._reference_runs: Optional["ReferenceRuns"] = None
-        self._sys_config: Optional[SysConfigCache] = None
-        self._analyses_cache: Dict[int, List[Dict[str, Any]]] = {}
+        self._reference_runs: ReferenceRuns | None = None
+        self._sys_config: SysConfigCache | None = None
+        # Keyed by (program_id, version_id): stored analyses are recorded per
+        # deal version, so a versioned read must not serve the live entry.
+        self._analyses_cache: dict[tuple[int, int | None], list[dict[str, Any]]] = {}
+        # (program_id, version_id) -> save date string exactly as the API
+        # reported it. Populated whenever a deal's version list is fetched
+        # (get_program_versions), since a version's save date never changes —
+        # so a loop over a deal's versions costs a single list fetch.
+        self._version_save_dates: dict[tuple[int, int], str] = {}
+        # (program_id, version_id) -> deal document. A past version cannot
+        # change, and each miss costs the server a full history rebuild, so a
+        # loop over versions must not re-request one it has already read.
+        self._versioned_programs: dict[tuple[int, int], dict[str, Any]] = {}
 
     def _api_url(self, module: str, path: str) -> str:
         """Build an absolute URL for the given Foundation module and path."""
         return f"{self.base_url}:{self.PORTS[module]}/{path.lstrip('/')}"
 
-    def _fetch(self, module: str, path: str, *, method: str = "GET", **kwargs: Any) -> Any:
+    def _fetch(
+        self, module: str, path: str, *, method: str = "GET", **kwargs: Any
+    ) -> Any:
         """Issue an authenticated JSON request and return the parsed response.
 
         Args:
@@ -67,13 +111,40 @@ class FoundationClient:
             path: API path relative to the module root (e.g. '/api/ref').
             method: HTTP method.
             **kwargs: Forwarded to requests.Session.request (e.g. json=payload).
+                Pass timeout= to override this client's default for one call.
 
         Raises:
-            requests.HTTPError: on non-2xx responses.
+            FoundationHTTPError: on non-2xx responses. The subclass identifies
+                the status (AuthenticationError, NotFoundError, ...), and the
+                message carries the server's response body.
         """
+        return self.request(module, path, method=method, **kwargs).json()
+
+    def request(
+        self, module: str, path: str, *, method: str = "GET", **kwargs: Any
+    ) -> requests.Response:
+        """Issue an authenticated request and return the raw response.
+
+        The timeout default and the error mapping belong to the transport, not
+        to each caller: every site that reached past this method for the raw
+        Response had to remember both, and none of them did until 0.12.
+
+        Args:
+            module: Module key in PORTS (e.g. 'deal', 'common', 'loss').
+            path: API path relative to the module root (e.g. '/api/ref').
+            method: HTTP method.
+            **kwargs: Forwarded to requests.Session.request, including stream=.
+                Pass timeout= to override this client's default for one call.
+
+        Raises:
+            FoundationHTTPError: on non-2xx responses. The subclass identifies
+                the status (AuthenticationError, NotFoundError, ...), and the
+                message carries the server's response body.
+        """
+        kwargs.setdefault("timeout", self.timeout)
         response = self._session.request(method, self._api_url(module, path), **kwargs)
-        response.raise_for_status()
-        return response.json()
+        raise_for_status(response)
+        return response
 
     def authenticate(
         self, email: str, password: str, api_client_id: str, api_client_secret: str
@@ -88,7 +159,7 @@ class FoundationClient:
             api_client_secret: API client secret
 
         Raises:
-            requests.HTTPError: If authentication fails
+            AuthenticationError: If the credentials are rejected.
         """
         data = self._fetch(
             "identity",
@@ -137,7 +208,7 @@ class FoundationClient:
         def result_or_warn(key: str, warn_msg: str, default: Any) -> Any:
             try:
                 return futures[key].result()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - this fetch is optional
                 warnings.warn(f"{warn_msg}: {exc}", stacklevel=3)
                 return default
 
@@ -178,10 +249,17 @@ class FoundationClient:
         self._module_custom_tables = {}
         for table_id, table_def in self._ref_cache._custom_tables.items():
             if table_def.get("dataLevelId") == 1:  # Module level
+                original_name = table_def.get("name")
+                if not original_name:
+                    warnings.warn(
+                        f"Skipping module custom table {table_id}: it has no name.",
+                        stacklevel=2,
+                    )
+                    continue
+
                 columns = self._ref_cache.get_custom_table_columns(table_id)
                 column_names = [col["name"] for col in columns]
-                snake_name = camel_to_snake(table_def["name"])
-                original_name = table_def["name"]
+                snake_name = camel_to_snake(original_name)
 
                 table = ModuleCustomTable(
                     client=self,
@@ -193,10 +271,23 @@ class FoundationClient:
                 )
                 self._module_custom_tables[snake_name] = table
 
+                # Any real attribute - a reference-table property, a method, or
+                # an instance attribute such as base_url - wins normal lookup,
+                # so __getattr__ never sees the name and the custom table is
+                # unreachable by dot access. Check __dict__ rather than
+                # hasattr(self, ...), which would route back into __getattr__.
+                if snake_name in vars(self) or hasattr(type(self), snake_name):
+                    warnings.warn(
+                        f"Custom table '{original_name}' shares a name with "
+                        f"'client.{snake_name}'. Use "
+                        f"client.get_custom_table('{original_name}') to reach it.",
+                        stacklevel=2,
+                    )
+
         self._reference_runs = ReferenceRuns(reference_runs_data, self._ref_cache)
         self._sys_config = SysConfigCache(sys_configs_data)
 
-    def _load_accessible_objects(self, deal_ref_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _load_accessible_objects(self, deal_ref_data: dict[str, Any]) -> dict[str, Any]:
         """Load accessible objects and their values for lookup field resolution.
 
         Collects all unique lookupObjectId values from custom table column
@@ -212,11 +303,9 @@ class FoundationClient:
             Dictionary with 'definitions' (list of accessible object definitions)
             and 'values' (list of AccessibleObjectResult from BulkSelection).
         """
-        result: Dict[str, Any] = {"definitions": [], "values": []}
+        result: dict[str, Any] = {"definitions": [], "values": []}
 
-        column_defs = deal_ref_data.get("customTableColumnDefinitions", {}).get(
-            "values", []
-        )
+        column_defs = ref_values(deal_ref_data, "customTableColumnDefinitions")
         lookup_ids = {
             col["lookupObjectId"]
             for col in column_defs
@@ -231,7 +320,7 @@ class FoundationClient:
             result["definitions"] = [
                 ao for ao in all_accessible_objects if ao.get("id") in lookup_ids
             ]
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reference data is best-effort
             warnings.warn(
                 f"Failed to load accessible object definitions: {exc}",
                 stacklevel=2,
@@ -246,7 +335,7 @@ class FoundationClient:
                 method="POST",
                 json={"accessibleObjectIds": sorted(lookup_ids)},
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - reference data is best-effort
             warnings.warn(
                 f"Failed to load accessible object values: {exc}",
                 stacklevel=2,
@@ -297,7 +386,309 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._sys_config
 
-    def get_model_ids_by_view_id(self, model_view_id: int) -> List[int]:
+    # Reference Tables (v0.9.0)
+    #
+    # Every server reference table is exposed as a property returning a
+    # ReferenceTable: a list of models with .by_id / .by_name / .by_code
+    # lookups and .as_polars() / .as_pandas() output. Rows are filtered to
+    # active ones. All payloads are already fetched by authenticate(), so
+    # reading a property costs no HTTP request.
+
+    def _reference(self, name: str) -> "ReferenceTable":
+        """Return a reference table by name.
+
+        Raises RuntimeError rather than AttributeError: an AttributeError
+        escaping a property body is swallowed by __getattr__ and re-reported
+        as "object has no attribute", hiding the real cause.
+        """
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.reference_table(name)
+
+    # --- Deal module ---
+
+    @property
+    def brokers(self) -> "ReferenceTable":
+        """Brokers.
+
+        Example:
+            >>> client.brokers.by_name["Aon"]
+            >>> client.brokers.as_polars()
+        """
+        return self._reference("brokers")
+
+    @property
+    def broker_offices(self) -> "ReferenceTable":
+        """Broker offices."""
+        return self._reference("broker_offices")
+
+    @property
+    def categories(self) -> "ReferenceTable":
+        """Deal categories."""
+        return self._reference("categories")
+
+    @property
+    def category_details(self) -> "ReferenceTable":
+        """Deal category details."""
+        return self._reference("category_details")
+
+    @property
+    def category_detail_maps(self) -> "ReferenceTable":
+        """Mappings between categories and category details."""
+        return self._reference("category_detail_maps")
+
+    @property
+    def currencies(self) -> "ReferenceTable":
+        """Currencies. Look up by ISO code with ``by_code["USD"]``."""
+        return self._reference("currencies")
+
+    @property
+    def custom_fields(self) -> "ReferenceTable":
+        """Custom field definitions."""
+        return self._reference("custom_fields")
+
+    @property
+    def external_ref_types(self) -> "ReferenceTable":
+        """External reference types."""
+        return self._reference("external_ref_types")
+
+    @property
+    def layer_limit_attach_types(self) -> "ReferenceTable":
+        """Layer limit/attachment types."""
+        return self._reference("layer_limit_attach_types")
+
+    @property
+    def loss_group_types(self) -> "ReferenceTable":
+        """Loss group types."""
+        return self._reference("loss_group_types")
+
+    @property
+    def layer_order_term_types(self) -> "ReferenceTable":
+        """Layer order term types."""
+        return self._reference("layer_order_term_types")
+
+    @property
+    def layer_premium_types(self) -> "ReferenceTable":
+        """Layer premium types."""
+        return self._reference("layer_premium_types")
+
+    @property
+    def metrics(self) -> "ReferenceTable":
+        """Metric definitions."""
+        return self._reference("metrics")
+
+    @property
+    def participants(self) -> "ReferenceTable":
+        """Participants (markets)."""
+        return self._reference("participants")
+
+    @property
+    def program_groups(self) -> "ReferenceTable":
+        """Deal groups."""
+        return self._reference("program_groups")
+
+    @property
+    def participant_statuses(self) -> "ReferenceTable":
+        """Participant statuses."""
+        return self._reference("participant_statuses")
+
+    @property
+    def tokens(self) -> "ReferenceTable":
+        """UI tokens."""
+        return self._reference("tokens")
+
+    @property
+    def token_module_maps(self) -> "ReferenceTable":
+        """Token-to-module mappings."""
+        return self._reference("token_module_maps")
+
+    @property
+    def token_types(self) -> "ReferenceTable":
+        """Token types."""
+        return self._reference("token_types")
+
+    @property
+    def units_of_measure(self) -> "ReferenceTable":
+        """Units of measure."""
+        return self._reference("units_of_measure")
+
+    @property
+    def custom_field_lookups(self) -> "ReferenceTable":
+        """Custom field lookup values."""
+        return self._reference("custom_field_lookups")
+
+    @property
+    def reinst_prem_bases(self) -> "ReferenceTable":
+        """Reinstatement premium bases."""
+        return self._reference("reinst_prem_bases")
+
+    @property
+    def custom_table_definitions(self) -> "ReferenceTable":
+        """Custom table definitions.
+
+        For the data in a module-level custom table use
+        ``client.get_custom_table(name)`` instead.
+        """
+        return self._reference("custom_table_definitions")
+
+    @property
+    def custom_table_column_definitions(self) -> "ReferenceTable":
+        """Custom table column definitions."""
+        return self._reference("custom_table_column_definitions")
+
+    @property
+    def custom_table_definitions_data_sort(self) -> "ReferenceTable":
+        """Custom table sort definitions."""
+        return self._reference("custom_table_definitions_data_sort")
+
+    @property
+    def pages(self) -> "ReferenceTable":
+        """UI pages."""
+        return self._reference("pages")
+
+    @property
+    def components(self) -> "ReferenceTable":
+        """UI components."""
+        return self._reference("components")
+
+    @property
+    def ui_locations(self) -> "ReferenceTable":
+        """UI locations."""
+        return self._reference("ui_locations")
+
+    @property
+    def ui_location_options(self) -> "ReferenceTable":
+        """UI location options."""
+        return self._reference("ui_location_options")
+
+    @property
+    def layer_statuses(self) -> "ReferenceTable":
+        """Layer statuses."""
+        return self._reference("layer_statuses")
+
+    @property
+    def ref_exceptions(self) -> "ReferenceTable":
+        """Reference exceptions."""
+        return self._reference("ref_exceptions")
+
+    @property
+    def reports(self) -> "ReferenceTable":
+        """Report definitions."""
+        return self._reference("reports")
+
+    @property
+    def reference_run(self) -> "ReferenceTable":
+        """Reference run reference table.
+
+        Singular: ``client.reference_runs`` is a different thing - the active
+        reference runs from /api/referenceRuns, which convert to run
+        configurations.
+        """
+        return self._reference("reference_run")
+
+    @property
+    def functions(self) -> "ReferenceTable":
+        """Function definitions."""
+        return self._reference("functions")
+
+    @property
+    def layout_options(self) -> "ReferenceTable":
+        """UI layout options."""
+        return self._reference("layout_options")
+
+    @property
+    def sys_configs(self) -> "ReferenceTable":
+        """Deal module system configuration entries.
+
+        Distinct from ``client.sys_config``, the Loss module column-alias cache.
+        """
+        return self._reference("sys_configs")
+
+    @property
+    def clients(self) -> "ReferenceTable":
+        """Clients (cedants)."""
+        return self._reference("clients")
+
+    # --- Common module ---
+
+    @property
+    def perils(self) -> "ReferenceTable":
+        """Perils. Look up by code with ``by_code["EQ"]``."""
+        return self._reference("perils")
+
+    @property
+    def regions(self) -> "ReferenceTable":
+        """Regions. Look up by code with ``by_code["NA"]``."""
+        return self._reference("regions")
+
+    @property
+    def models(self) -> "ReferenceTable":
+        """Catastrophe models (not the foundation.models package)."""
+        return self._reference("models")
+
+    @property
+    def model_views(self) -> "ReferenceTable":
+        """Model views."""
+        return self._reference("model_views")
+
+    @property
+    def model_view_details(self) -> "ReferenceTable":
+        """Model view details."""
+        return self._reference("model_view_details")
+
+    @property
+    def accessible_objects(self) -> "ReferenceTable":
+        """Accessible object definitions used by lookup columns."""
+        return self._reference("accessible_objects")
+
+    @property
+    def ref_grid_displays(self) -> "ReferenceTable":
+        """Reference grid display definitions."""
+        return self._reference("ref_grid_displays")
+
+    @property
+    def ref_grid_display_columns(self) -> "ReferenceTable":
+        """Reference grid display column definitions."""
+        return self._reference("ref_grid_display_columns")
+
+    # --- Loss module ---
+
+    @property
+    def event_sets(self) -> "ReferenceTable":
+        """Event sets."""
+        return self._reference("event_sets")
+
+    @property
+    def loss_types(self) -> "ReferenceTable":
+        """Loss types."""
+        return self._reference("loss_types")
+
+    @property
+    def perspectives(self) -> "ReferenceTable":
+        """Loss perspectives."""
+        return self._reference("perspectives")
+
+    @property
+    def variants(self) -> "ReferenceTable":
+        """Loss variants."""
+        return self._reference("variants")
+
+    @property
+    def vendors(self) -> "ReferenceTable":
+        """Model vendors (RMS, AIR, ...)."""
+        return self._reference("vendors")
+
+    @property
+    def upload_statuses(self) -> "ReferenceTable":
+        """Loss set upload statuses."""
+        return self._reference("upload_statuses")
+
+    @property
+    def event_split_views(self) -> "ReferenceTable":
+        """Event split views."""
+        return self._reference("event_split_views")
+
+    def get_model_ids_by_view_id(self, model_view_id: int) -> list[int]:
         """Get list of model IDs for a given model view ID.
 
         Model views are collections of models defined in the Common Module.
@@ -318,60 +709,172 @@ class FoundationClient:
             return []
         return self._ref_cache.get_model_ids_by_view_id(model_view_id)
 
-    def get_program(self, program_id: int) -> "Program":
+    def get_program_versions(self, program_id: int) -> "ProgramVersions":
         """
-        Retrieve a program by ID.
+        List the saved versions of a deal, newest first.
+
+        Args:
+            program_id: The program ID whose versions to list
+
+        Returns:
+            ProgramVersions collection
+
+        Raises:
+            FoundationHTTPError: If the request fails
+
+        Example:
+            >>> versions = client.get_program_versions(2455)
+            >>> versions.describe()
+        """
+        from .program_versions import ProgramVersions
+
+        # ByProgramId, not the generic ProgramVersions/{id} route: only this
+        # one tags SaveDate as UTC, and an untagged timestamp would be read as
+        # local time and select the wrong instant.
+        versions_data = self._fetch(
+            "deal", f"/api/ProgramVersions/ByProgramId/{program_id}"
+        )
+        versions = ProgramVersions(versions_data)
+        # A version's save date never changes, so cache each one: a later
+        # versioned read of this deal — including via program.versions then
+        # get_version — resolves without re-fetching the list. The list itself
+        # is not cached; it grows as the deal is saved.
+        for version in versions:
+            if version.raw_save_date:
+                self._version_save_dates[(program_id, version.id)] = (
+                    version.raw_save_date
+                )
+        return versions
+
+    def _resolve_version_save_date(self, program_id: int, version_id: int) -> str:
+        """Return the save date identifying a version of a deal.
+
+        Looking the version up within its deal's own version list also rules
+        out a version ID belonging to a different deal, which would otherwise
+        silently return that deal's state at an unrelated moment.
+        """
+        cached = self._version_save_dates.get((program_id, version_id))
+        if cached is not None:
+            return cached
+
+        # Fetching the list caches every version's save date (see
+        # get_program_versions), so this is the only fetch a loop over a deal's
+        # versions costs.
+        version = self.get_program_versions(program_id).get_by_id(version_id)
+        if version is None:
+            raise ValueError(
+                f"Version {version_id} does not belong to deal {program_id}. "
+                "Use program.versions to list the versions of a deal."
+            )
+        if not version.raw_save_date:
+            raise ValueError(
+                f"Version {version_id} of deal {program_id} has no save date, "
+                "so the deal cannot be read at that version."
+            )
+        return version.raw_save_date
+
+    def get_program(self, program_id: int, version_id: int | None = None) -> "Program":
+        """
+        Retrieve a program by ID, optionally as it stood at a past version.
 
         Args:
             program_id: The program ID to retrieve
+            version_id: Saved version to read; omit for the current deal
 
         Returns:
-            Program instance with enriched data
+            Program instance with enriched data. A versioned program is
+            read-only.
 
         Raises:
-            requests.HTTPError: If the request fails
+            FoundationHTTPError: If the request fails
+            ValueError: If the version does not belong to this deal
 
         Example:
             >>> program = client.get_program(2455)
             >>> print(program.name)
             >>> print(program.uw_year)
+
+            >>> previous = client.get_program(2455, version_id=23011)
+            >>> print(previous.layers[0].collateral_req_share)
         """
         from .program import Program
 
-        program_data = self._fetch("deal", f"/api/programs/{program_id}")
+        if version_id is None:
+            program_data = self._fetch("deal", f"/api/programs/{program_id}")
+            analyses_path = f"/api/analysesByProgram/{program_id}"
+        else:
+            cached_program = self._versioned_programs.get((program_id, version_id))
+            if cached_program is None:
+                save_date = self._resolve_version_save_date(program_id, version_id)
+                # The /Restore route, not the plain AsOfDate one: the latter
+                # returns the live deal whenever the requested instant is at or
+                # after the newest save, which is exactly the case when reading
+                # the newest version. That would report edits made since the
+                # save as though they were part of it. /Restore always
+                # reconstructs from history and performs no writes.
+                cached_program = self._fetch(
+                    "deal",
+                    f"/api/Programs/{program_id}"
+                    f"/AsOfDate/{quote(save_date, safe='')}/Restore",
+                )
+                self._versioned_programs[(program_id, version_id)] = cached_program
+            # Each Program owns its document, so hand out a copy rather than
+            # letting two snapshots of one version share mutable state.
+            program_data = copy.deepcopy(cached_program)
+            # Stored analyses live in the current tables tagged with the
+            # version that produced them, so they are selected by version ID
+            # rather than reconstructed from history.
+            analyses_path = (
+                f"/api/AnalysesByProgram/{program_id}/AsOfVersion/{version_id}"
+            )
 
         # Fetch stored analyses from Metrics API (if available). Cache per
-        # program_id so repeated get_program() calls don't re-hit the endpoint.
-        if program_id not in self._analyses_cache:
+        # (program_id, version_id) so repeated get_program() calls don't
+        # re-hit the endpoint.
+        cache_key = (program_id, version_id)
+        if cache_key not in self._analyses_cache:
             try:
-                self._analyses_cache[program_id] = self._fetch(
-                    "deal", f"/api/analysesByProgram/{program_id}"
-                )
-            except Exception:
-                self._analyses_cache[program_id] = []
+                self._analyses_cache[cache_key] = self._fetch("deal", analyses_path)
+            except Exception:  # noqa: BLE001 - stored analyses are optional
+                self._analyses_cache[cache_key] = []
 
-        return Program(program_data, self._ref_cache, self._analyses_cache[program_id], self)
+        return Program(
+            program_data,
+            self._ref_cache,
+            self._analyses_cache[cache_key],
+            self,
+            version_id=version_id,
+        )
 
-    def get_layer(self, layer_id: int) -> "Layer":
+    def get_layer(self, layer_id: int, version_id: int | None = None) -> "Layer":
         """
-        Retrieve a layer by ID.
+        Retrieve a layer by ID, optionally as it stood at a past version.
+
+        The layer must exist in the deal as it stands now: layers are located
+        through a map of the current deals. A layer that has since been
+        deleted is still reachable through its deal, via
+        ``client.get_program(deal_id, version_id=...).layers``.
 
         Args:
             layer_id: The layer ID to retrieve
+            version_id: Saved version to read; omit for the current layer
 
         Returns:
-            Layer instance with enriched data
+            Layer instance with enriched data. A versioned layer is read-only.
 
         Raises:
-            requests.HTTPError: If the request fails
-            ValueError: If the layer ID is not found
+            FoundationHTTPError: If the request fails
+            ValueError: If the layer ID is not found, or did not exist yet in
+                the requested version
 
         Example:
             >>> layer = client.get_layer(10581)
             >>> print(layer.name)
             >>> print(layer.incept_date)
+
+            >>> previous = client.get_layer(10581, version_id=23011)
+            >>> print(previous.collateral_req_share)
         """
-        from .layer import Layer
 
         # Find the program ID for this layer
         program_id = self._layer_headers.get(layer_id)
@@ -379,12 +882,18 @@ class FoundationClient:
             raise ValueError(f"Layer {layer_id} not found")
 
         # Get the full program
-        program = self.get_program(program_id)
+        program = self.get_program(program_id, version_id=version_id)
 
         # Find and return the specific layer
         for layer in program.layers:
             if layer.id == layer_id:
                 return layer
+
+        if version_id is not None:
+            raise ValueError(
+                f"Layer {layer_id} was not part of deal {program_id} "
+                f"at version {version_id}."
+            )
 
         # Layer not found in program (should not happen)
         raise ValueError(f"Layer {layer_id} not found in program {program_id}")
@@ -396,7 +905,7 @@ class FoundationClient:
 
     # Reference Data Access Methods (v0.3.0)
 
-    def get_peril(self, identifier: Union[int, str]) -> Optional["Peril"]:
+    def get_peril(self, identifier: int | str) -> Optional["Peril"]:
         """
         Get peril by ID or code.
 
@@ -415,23 +924,7 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_peril(identifier)
 
-    def get_all_perils(self) -> List["Peril"]:
-        """
-        Get all perils.
-
-        Returns:
-            List of all Peril instances
-
-        Example:
-            >>> perils = client.get_all_perils()
-            >>> for peril in perils:
-            ...     print(f"{peril.code}: {peril.name}")
-        """
-        if self._ref_cache is None:
-            raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_perils()
-
-    def get_region(self, identifier: Union[int, str]) -> Optional["Region"]:
+    def get_region(self, identifier: int | str) -> Optional["Region"]:
         """
         Get region by ID or code.
 
@@ -452,23 +945,7 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_region(identifier)
 
-    def get_all_regions(self) -> List["Region"]:
-        """
-        Get all regions.
-
-        Returns:
-            List of all Region instances
-
-        Example:
-            >>> regions = client.get_all_regions()
-            >>> for region in regions:
-            ...     print(f"{region.code}: {region.name}")
-        """
-        if self._ref_cache is None:
-            raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_regions()
-
-    def get_participant(self, identifier: Union[int, str]) -> Optional["Participant"]:
+    def get_participant(self, identifier: int | str) -> Optional["Participant"]:
         """
         Get participant by ID or name.
 
@@ -487,23 +964,7 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_participant(identifier)
 
-    def get_all_participants(self) -> List["Participant"]:
-        """
-        Get all participants.
-
-        Returns:
-            List of all Participant instances
-
-        Example:
-            >>> participants = client.get_all_participants()
-            >>> for participant in participants:
-            ...     print(participant.name)
-        """
-        if self._ref_cache is None:
-            raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_participants()
-
-    def get_vendor(self, identifier: Union[int, str]) -> Optional["Vendor"]:
+    def get_vendor(self, identifier: int | str) -> Optional["Vendor"]:
         """
         Get vendor by ID or name.
 
@@ -520,18 +981,7 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_vendor(identifier)
 
-    def get_all_vendors(self) -> List["Vendor"]:
-        """
-        Get all vendors.
-
-        Returns:
-            List of all Vendor instances
-        """
-        if self._ref_cache is None:
-            raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_vendors()
-
-    def get_variant(self, identifier: Union[int, str]) -> Optional["Variant"]:
+    def get_variant(self, identifier: int | str) -> Optional["Variant"]:
         """
         Get variant by ID or name.
 
@@ -548,20 +998,7 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_variant(identifier)
 
-    def get_all_variants(self) -> List["Variant"]:
-        """
-        Get all variants.
-
-        Returns:
-            List of all Variant instances
-        """
-        if self._ref_cache is None:
-            raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_variants()
-
-    def get_perspective(
-        self, identifier: Union[int, str]
-    ) -> Optional["Perspective"]:
+    def get_perspective(self, identifier: int | str) -> Optional["Perspective"]:
         """
         Get perspective by ID or name.
 
@@ -578,18 +1015,7 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_perspective(identifier)
 
-    def get_all_perspectives(self) -> List["Perspective"]:
-        """
-        Get all perspectives.
-
-        Returns:
-            List of all Perspective instances
-        """
-        if self._ref_cache is None:
-            raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_perspectives()
-
-    def get_event_set(self, identifier: Union[int, str]) -> Optional["EventSet"]:
+    def get_event_set(self, identifier: int | str) -> Optional["EventSet"]:
         """
         Get event set by ID or name.
 
@@ -606,52 +1032,105 @@ class FoundationClient:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_event_set(identifier)
 
-    def get_all_event_sets(self) -> List["EventSet"]:
-        """
-        Get all event sets.
-
-        Returns:
-            List of all EventSet instances
-        """
-        if self._ref_cache is None:
-            raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_event_sets()
-
-    def get_client(self, identifier: Union[int, str]) -> Optional["Client"]:
+    def get_client(self, identifier: int | str) -> Optional["Client"]:
         """Get a client by ID or name (case-insensitive)."""
         if self._ref_cache is None:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
         return self._ref_cache.get_client(identifier)
 
-    def get_all_clients(self) -> List["Client"]:
-        """Get all clients."""
+    def get_broker(self, identifier: int | str) -> Optional["Broker"]:
+        """Get a broker by ID or name (case-insensitive)."""
         if self._ref_cache is None:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_clients()
+        return self._ref_cache.get_broker(identifier)
 
-    def get_category(self, category_id: int) -> Optional[Dict[str, Any]]:
-        """Get a category by ID (raw dict from /api/ref)."""
+    def get_broker_office(self, identifier: int | str) -> Optional["BrokerOffice"]:
+        """Get a broker office by ID or name (case-insensitive)."""
         if self._ref_cache is None:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_category(category_id)
+        return self._ref_cache.get_broker_office(identifier)
 
-    def get_all_categories(self) -> List[Dict[str, Any]]:
-        """Get all categories as raw dicts."""
+    def get_currency(self, identifier: int | str) -> Optional["Currency"]:
+        """Get a currency by ID, code or name (case-insensitive)."""
         if self._ref_cache is None:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_categories()
+        return self._ref_cache.get_currency(identifier)
 
-    def get_category_detail(self, detail_id: int) -> Optional[Dict[str, Any]]:
-        """Get a category detail by ID (raw dict from /api/ref)."""
+    def get_unit_of_measure(self, identifier: int | str) -> Optional["UnitOfMeasure"]:
+        """Get a unit of measure by ID or name (case-insensitive)."""
         if self._ref_cache is None:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_category_detail(detail_id)
+        return self._ref_cache.get_unit_of_measure(identifier)
 
-    def get_all_category_details(self) -> List[Dict[str, Any]]:
-        """Get all category details as raw dicts."""
+    def get_layer_status(self, identifier: int | str) -> Optional["LayerStatus"]:
+        """Get a layer status by ID, code or name (case-insensitive)."""
         if self._ref_cache is None:
             raise RuntimeError("Client not authenticated. Call authenticate() first.")
-        return self._ref_cache.get_all_category_details()
+        return self._ref_cache.get_layer_status(identifier)
+
+    def get_layer_limit_attach_type(
+        self, identifier: int | str
+    ) -> Optional["LayerLimitAttachType"]:
+        """Get a layer limit/attach type by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_layer_limit_attach_type(identifier)
+
+    def get_layer_premium_type(
+        self, identifier: int | str
+    ) -> Optional["LayerPremiumType"]:
+        """Get a layer premium type by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_layer_premium_type(identifier)
+
+    def get_layer_order_term_type(
+        self, identifier: int | str
+    ) -> Optional["LayerOrderTermType"]:
+        """Get a layer order term type by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_layer_order_term_type(identifier)
+
+    def get_participant_status(
+        self, identifier: int | str
+    ) -> Optional["ParticipantStatus"]:
+        """Get a participant status by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_participant_status(identifier)
+
+    def get_reinst_prem_base(self, identifier: int | str) -> Optional["ReinstPremBase"]:
+        """Get a reinstatement premium base by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_reinst_prem_base(identifier)
+
+    def get_external_ref_type(
+        self, identifier: int | str
+    ) -> Optional["ExternalRefType"]:
+        """Get an external reference type by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_external_ref_type(identifier)
+
+    def get_custom_field(self, identifier: int | str) -> Optional["CustomField"]:
+        """Get a custom field definition by ID or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_custom_field(identifier)
+
+    def get_category(self, identifier: int | str) -> Optional["Category"]:
+        """Get a category by ID, code or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_category(identifier)
+
+    def get_category_detail(self, identifier: int | str) -> Optional["CategoryDetail"]:
+        """Get a category detail by ID, code or name (case-insensitive)."""
+        if self._ref_cache is None:
+            raise RuntimeError("Client not authenticated. Call authenticate() first.")
+        return self._ref_cache.get_category_detail(identifier)
 
     # Module-Level Custom Tables Access Methods (v0.5.0)
 
@@ -697,7 +1176,7 @@ class FoundationClient:
         raise ValueError(f"Module-level custom table '{table_name}' not found")
 
     @property
-    def custom_tables_names(self) -> List[str]:
+    def custom_tables_names(self) -> list[str]:
         """
         List all available module-level custom table names (snake_case).
 
@@ -741,14 +1220,18 @@ class FoundationClient:
             print(f"  Custom Tables: {len(table_names)} module-level")
             for t in table_names:
                 print(f"    - {t}")
+        print(
+            f"  Ref. Tables: {len(REFERENCE_TABLES)} (e.g. brokers, clients, participants, vendors)"
+        )
         print()
         print("PROPERTIES:")
         print("  reference_runs       -> ReferenceRuns")
         print("  custom_tables_names  -> list[str]")
+        print("  <reference table>    -> ReferenceTable")
         print()
         print("METHODS:")
         print("  get_program(id)      -> Program")
-        print("  save_program(prog)   -> Program")
+        print("  get_custom_table(nm) -> ModuleCustomTable")
         print("  describe()           -> None")
         print("=" * 60)
         print()
@@ -759,6 +1242,8 @@ class FoundationClient:
         Includes standard properties, methods, and dynamically-available
         module custom table names.
         """
+        # Reference-table properties are real class attributes, so
+        # super().__dir__() already covers them.
         attrs = set(super().__dir__())
         attrs.update(
             [
@@ -766,7 +1251,8 @@ class FoundationClient:
                 "reference_runs",
                 "authenticate",
                 "get_program",
-                "save_program",
+                "get_custom_table",
+                "custom_tables_names",
                 "describe",
             ]
         )
@@ -791,6 +1277,8 @@ class FoundationClient:
         Raises:
             AttributeError: If attribute not found
         """
+        raise_if_private(self, name)
+
         # Check module-level custom tables
         if name in self._module_custom_tables:
             return self._module_custom_tables[name]

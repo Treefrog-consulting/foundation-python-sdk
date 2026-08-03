@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import copy
-from typing import Any, Dict, List, Optional, Sequence, TYPE_CHECKING
+from collections.abc import Sequence
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Any
 
-import pandas as pd
+from ..utils import require
 
-if TYPE_CHECKING:  # pragma: no cover - for type checking only
-    from .foundation_client import FoundationClient
+if TYPE_CHECKING:
+    import pandas as pd  # pragma: no cover - for type checking only
+    import polars as pl
+
     from ..ref_data import ReferenceDataCache
+    from .foundation_client import FoundationClient
 
 
 class ModuleCustomTable:
@@ -25,8 +30,8 @@ class ModuleCustomTable:
 
     def __init__(
         self,
-        client: "FoundationClient",
-        ref_cache: "ReferenceDataCache",
+        client: FoundationClient,
+        ref_cache: ReferenceDataCache,
         table_id: int,
         snake_name: str,
         original_name: str,
@@ -38,8 +43,8 @@ class ModuleCustomTable:
         self._snake_name = snake_name
         self._original_name = original_name
         self._column_names = list(column_names)
-        self._rows: Optional[List[Dict[str, Any]]] = None
-        self._frame: Optional[pd.DataFrame] = None
+        self._rows: list[dict[str, Any]] | None = None
+        self._frame: pd.DataFrame | None = None
         self._loaded = False
 
     @property
@@ -53,7 +58,7 @@ class ModuleCustomTable:
         return self._snake_name
 
     @property
-    def columns(self) -> List[str]:
+    def columns(self) -> list[str]:
         """Column names defined for the table."""
         return list(self._column_names)
 
@@ -100,6 +105,7 @@ class ModuleCustomTable:
         """
         self._ensure_loaded()
 
+        pd = require("pandas", "as_pandas")
         if self._frame is None:
             frame = pd.DataFrame(self._rows)
             if self._column_names:
@@ -111,7 +117,61 @@ class ModuleCustomTable:
 
         return self._frame
 
-    def to_records(self) -> List[Dict[str, Any]]:
+    def as_polars(self) -> pl.DataFrame:
+        """
+        Return the table as a polars DataFrame.
+
+        Columns are the table's declared columns, in declared order. A new
+        DataFrame is built on every call, so edits never leak between callers.
+        Once as_pandas() has been called its cached frame becomes the source, so
+        in-place pandas edits are reflected here.
+
+        Date columns come back as datetimes: a column can hold both date and
+        datetime values, which polars cannot mix.
+
+        Note: Changes to the DataFrame are local only and won't be saved to the backend.
+        """
+        pl = require("polars", "as_polars")
+
+        self._ensure_loaded()
+        # to_records() deep-copies so its callers can mutate; this builds fresh
+        # dicts below anyway, so read the live rows directly.
+        rows = (
+            self._frame_to_rows(self._frame)
+            if self._frame is not None
+            else (self._rows or [])
+        )
+
+        if not rows:
+            return pl.DataFrame(schema={c: pl.Null for c in self._column_names})
+
+        # datetime is a subclass of date, so compare the exact type.
+        normalized = [
+            {
+                # A date-only cell widened so polars can hold one column
+                # type; naive on purpose, the server stored no time.
+                key: datetime(value.year, value.month, value.day)  # noqa: DTZ001
+                if type(value) is date
+                else value
+                for key, value in row.items()
+            }
+            for row in rows
+        ]
+
+        frame = pl.DataFrame(normalized, infer_schema_length=None)
+
+        # A column whose valueType the SDK cannot map is absent from the rows
+        # but still declared, so add it back as null rather than raising.
+        if self._column_names:
+            frame = frame.select(
+                [
+                    pl.col(c) if c in frame.columns else pl.lit(None).alias(c)
+                    for c in self._column_names
+                ]
+            )
+        return frame
+
+    def to_records(self) -> list[dict[str, Any]]:
         """Return table data as a list of dictionaries."""
         self._ensure_loaded()
 
@@ -119,10 +179,11 @@ class ModuleCustomTable:
             return self._frame_to_rows(self._frame)
         return copy.deepcopy(self._rows) if self._rows else []
 
-    def _frame_to_rows(self, frame: pd.DataFrame) -> List[Dict[str, Any]]:
+    def _frame_to_rows(self, frame: pd.DataFrame) -> list[dict[str, Any]]:
         """Convert a DataFrame into list-of-dict records with None for missing values."""
         if frame.empty:
             return []
+        pd = require("pandas", "this table")
         sanitized = frame.where(pd.notna(frame), None)
         return sanitized.to_dict(orient="records")
 
@@ -136,6 +197,7 @@ class ModuleCustomTable:
                 "columns",
                 "row_count",
                 "as_pandas",
+                "as_polars",
                 "to_records",
                 "describe",
             ]
@@ -160,6 +222,7 @@ class ModuleCustomTable:
         print()
         print("METHODS:")
         print("  as_pandas()    -> pandas.DataFrame")
+        print("  as_polars()    -> polars.DataFrame")
         print("  to_records()   -> list[dict]")
         print("=" * 60)
         print()

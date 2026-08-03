@@ -1,7 +1,8 @@
 [project]
 name = "foundation-platform-sdk"
-version = "0.8.0"
+dynamic = ["version"]
 description = "Python SDK for the Foundation Platform API"
+readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "Proprietary"}
 authors = [
@@ -9,7 +10,7 @@ authors = [
 ]
 keywords = ["foundation", "platform", "api", "sdk", "insurance", "reinsurance"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "License :: Other/Proprietary License",
@@ -17,19 +18,35 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
 ]
 dependencies = [
     "requests>=2.31.0",
-    "pandas>=2.2.2",
-    "polars>=0.20.0",
-    "duckdb>=1.0.0",
-    "pyarrow>=22.0.0",
 ]
 
+# Reading deals, layers, reference data, versions and custom fields needs only
+# requests. The DataFrame stack is 150-500 MB and is pulled in only by the
+# accessor a caller actually uses; every one of them raises an ImportError
+# naming the extra to install.
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "requests-mock>=1.12.0",
+# duckdb alone serves the loss-export download and the single-metric lookups
+# (metric_results.get_by_name / get_by_id / get_by_source_name), which read
+# scalars straight out of the export and need no DataFrame library.
+duckdb = [
+    "duckdb>=1.0.0",
+]
+pandas = [
+    "foundation-platform-sdk[duckdb]",
+    "pandas>=2.2.2",
+]
+# pyarrow is not optional for polars output: duckdb's .pl() goes through Arrow.
+polars = [
+    "foundation-platform-sdk[duckdb]",
+    "polars>=1.0.0",
+    "pyarrow>=22.0.0",
+]
+all = [
+    "foundation-platform-sdk[pandas,polars]",
 ]
 
 [project.urls]
@@ -40,15 +57,47 @@ Documentation = "https://docs.foundationplatform.com/"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+# Single source of truth for the version; it was duplicated here and in
+# foundation/__init__.py and had to be kept in step by hand.
+[tool.hatch.version]
+path = "foundation/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["foundation"]
 
+# PEP 735. The duplicate [project.optional-dependencies].dev block this
+# replaced published the test tooling as an installable extra of the SDK.
 [dependency-groups]
 dev = [
+    "foundation-platform-sdk[all]",
     "pytest>=8.0.0",
     "requests-mock>=1.12.0",
+    "ruff>=0.6",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "F",      # pyflakes
+    "I",      # import sorting
+    "UP",     # pyupgrade — PEP 585/604 modern typing
+    "B",      # bugbear
+    "BLE",    # blind except
+    "DTZ",    # naive datetime
+    "RUF",
+]
+ignore = [
+    "E501",   # line length is enforced by the formatter, not the linter
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests construct partial objects and assert on broad failures by design.
+"tests/*" = ["B017", "B018"]

@@ -1,129 +1,765 @@
-"""Shared init helpers for Program/Layer custom field + custom table processing.
+"""Custom-field and custom-table machinery shared by Program and Layer.
 
-Program and Layer have identical shapes for their custom-field arrays
-(``programCustomFields`` / ``layerCustomFields``) and custom-table arrays
-(``customTables``). Both classes need to:
+Program and Layer expose the same custom-data surface: the ``custom_*_info``
+and ``custom_*_names`` properties, the get/set accessors, dot access and dot
+assignment, and the round-trip that folds edits back into the deal document.
+``CustomDataMixin`` owns all of it, so the two call sites cannot drift apart.
 
-- resolve ``customFieldId`` -> display name via the ref cache,
-- apply snake-case collision handling, and
-- bucket table rows by snake-cased table name while preserving the raw row
-  payload for later round-trip saves.
+Everything the two classes do differently is a class attribute declared at the
+top of the mixin plus two hooks (``_read_custom_table_entry`` for the shape of
+a ``customTables`` entry, ``_set_extra_attribute`` for a subclass's own dynamic
+names); nothing branches on type.
 
-These helpers centralize that logic so the two call sites stay in sync.
+``raise_if_private`` stays a free function: FoundationClient, ProgramCategories
+and ProgramExternalRefs need it without the rest of the mixin.
 """
 
-from typing import TYPE_CHECKING, Any, Dict, List, Tuple
+import copy
+from datetime import date, datetime
+from typing import TYPE_CHECKING, Any, ClassVar, Union
 
 from ..ref_data import ReferenceDataCache
-from ..utils import camel_to_snake, resolve_snake_case_collisions
+from ..utils import (
+    camel_to_snake,
+    parse_datetime_string,
+    resolve_snake_case_collisions,
+    snake_to_camel,
+    to_wire_datetime,
+)
+from .custom_table import CustomTable
 
 if TYPE_CHECKING:
-    from .custom_table import CustomTable
+    import pandas as pd
 
 
-def build_custom_field_values(
-    custom_fields: List[Dict[str, Any]],
-    ref_cache: ReferenceDataCache,
-) -> Tuple[Dict[str, str], Dict[str, Any]]:
-    """Resolve a ``*CustomFields`` array into a (name_mapping, values) pair.
+def raise_if_private(owner: Any, name: str) -> None:
+    """Refuse a ``_``-prefixed lookup from a dynamic ``__getattr__``.
 
-    Args:
-        custom_fields: Raw array from server, each entry has
-            ``customFieldId`` + ``value``.
-        ref_cache: Reference cache used to look up field definitions.
-
-    Returns:
-        A tuple of:
-            - ``name_mapping``: original field name -> snake_case name, with
-              collisions resolved so names stay unique.
-            - ``values``: snake_case name -> value.
+    copy, deepcopy and pickle probe for hooks such as ``__deepcopy__`` and
+    ``__getstate__`` before ``__init__`` has run. A ``__getattr__`` that answers
+    those from its own instance state re-enters itself for the very attribute it
+    is reading, and recurses until RecursionError.
     """
-    original_names: List[str] = []
-    for cf in custom_fields:
-        field_def = ref_cache.get_custom_field(cf.get("customFieldId"))
-        if field_def:
-            original_names.append(field_def["name"])
-
-    name_mapping = resolve_snake_case_collisions(original_names)
-
-    values: Dict[str, Any] = {}
-    for cf in custom_fields:
-        field_def = ref_cache.get_custom_field(cf.get("customFieldId"))
-        if not field_def:
-            continue
-        original_name = field_def["name"]
-        field_name = name_mapping.get(original_name, camel_to_snake(original_name))
-        values[field_name] = cf.get("value")
-
-    return name_mapping, values
+    if name.startswith("_"):
+        raise AttributeError(
+            f"'{type(owner).__name__}' object has no attribute '{name}'"
+        )
 
 
-def resolve_or_create_custom_table(
-    table_name: str,
-    *,
-    owner: Any,
-    ref_cache: ReferenceDataCache,
-    custom_tables: Dict[str, "CustomTable"],
-    custom_tables_info: List[Dict[str, Any]],
-    custom_table_original_names: Dict[str, str],
-    data_level_ids: Tuple[int, ...],
-) -> "CustomTable":
-    """Return an existing custom table by name, or create an empty one from ref data.
+class CustomDataMixin:
+    """Custom fields and custom tables for one level of the deal document.
 
-    The lookup chain (in order): already-materialized table dict, then the info
-    list (handles an on-the-fly rename), then the ref-cache definition filtered
-    by ``data_level_ids`` (program tables live at 2/4, layer tables at 3).
-    Falls through to an empty placeholder so callers can always dot-access the
-    table even if no rows exist yet.
+    Program and Layer hold the same machinery over different levels of the
+    same document. It lives here so the two cannot drift apart. What remains
+    per-class is the part that genuinely differs: their own document fields,
+    get_json, and the collections each exposes.
+
+    A subclass sets the six class attributes below and provides ``_data``,
+    ``_modifications``, ``_ref_cache`` and ``_require_writable``. Its
+    ``__init__`` calls :meth:`_init_custom_data`, builds whatever state of its
+    own it needs, then calls :meth:`_init_custom_metadata` with the row buckets
+    the first call returned.
     """
-    from .custom_table import CustomTable
 
-    snake_name = camel_to_snake(table_name)
-    table = custom_tables.get(snake_name)
-    if table:
-        return table
+    #: Reference-cache ``level`` of the custom fields this class owns.
+    _custom_field_level: ClassVar[int]
+    #: ``dataLevelId`` values of the custom tables this class owns. Table
+    #: definitions carry ``dataLevelId``, not the ``level`` key used by field
+    #: definitions; matching on ``level`` finds nothing at all.
+    _custom_table_data_level_ids: ClassVar[tuple[int, ...]]
+    #: Document key holding this class's custom-field array.
+    _custom_fields_key: ClassVar[str]
+    #: Owner word: the label in the unknown-name error, and the stem of the
+    #: ``<label>Id`` / ``<label>`` keys written into document rows.
+    _owner_label: ClassVar[str]
+    #: Whether to materialize a CustomTable for a declared table the payload
+    #: carried no rows for. Program does; Layer builds only the ones with rows.
+    #: A legacy divergence preserved deliberately, not a choice a new owner
+    #: should have to make -- the two classes simply grew apart.
+    _materialize_empty_tables: ClassVar[bool]
+    #: Whether :meth:`get_custom_field` parses timestamp strings into
+    #: datetimes. Layer does; Program returns the stored value unchanged.
+    #: Also a legacy divergence: Program was never given the parse. Changing
+    #: it would alter what get_custom_field returns, so it waits for a major.
+    _parse_custom_field_datetimes: ClassVar[bool]
 
-    for info in custom_tables_info:
-        if info["name"] == table_name or info["snake_case_name"] == snake_name:
-            return custom_tables[info["snake_case_name"]]
+    def _custom_data_names(self) -> set[str]:
+        """The dot-accessible names that exist only for this deal."""
+        return set(self._custom_field_values) | set(self._custom_tables)
 
-    target_id = None
-    column_names: List[str] = []
-    resolved_name = table_name
-    for table_id, table_def in ref_cache._custom_tables.items():
-        if table_def.get("dataLevelId") not in data_level_ids:
-            continue
-        current_snake = camel_to_snake(table_def["name"])
-        if table_def["name"] == table_name or current_snake == snake_name:
-            target_id = table_id
-            resolved_name = table_def["name"]
-            snake_name = current_snake
+    # --- describe -----------------------------------------------------
+
+    def _describe_custom_fields(self) -> None:
+        if not self._custom_field_values:
+            print("\nCUSTOM FIELDS: (none)")
+            return
+        print("\nCUSTOM FIELDS:")
+        print(f"  {'Field Name':<35} {'Value':<35}")
+        print(f"  {'-' * 35} {'-' * 35}")
+        for key, value in sorted(self._custom_field_values.items()):
+            value_str = str(value)[:33] if value is not None else "None"
+            print(f"  {key:<35} {value_str:<35}")
+        print(
+            f"\n  Available Custom Field Names: "
+            f"{', '.join(self.custom_fields_names) or '(none)'}"
+        )
+
+    def _describe_custom_tables(self) -> None:
+        if not self._custom_tables:
+            print("\nCUSTOM TABLES: (none)")
+            return
+        print("\nCUSTOM TABLES:")
+        print(f"  {'Table Name':<35} {'Rows':<10}")
+        print(f"  {'-' * 35} {'-' * 10}")
+        for snake_name in sorted(self._custom_tables.keys()):
+            table = self._custom_tables[snake_name]
+            print(f"  {table.name:<35} {table.row_count:<10}")
+        print(
+            f"\n  Available Custom Table Names: "
+            f"{', '.join(self.custom_tables_names) or '(none)'}"
+        )
+
+    # --- construction -----------------------------------------------------
+
+    def _init_custom_data(
+        self, data: dict[str, Any], ref_cache: ReferenceDataCache
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Read the custom-field values and bucket the raw custom-table rows.
+
+        Returns the snake_case table name -> rows mapping that
+        :meth:`_init_custom_metadata` needs. The two halves are separate calls
+        because each class builds state of its own in between.
+        """
+        self._custom_field_name_mapping, self._custom_field_values = (
+            self._resolve_custom_field_values(data, ref_cache)
+        )
+
+        raw_table_rows: dict[str, list[dict[str, Any]]] = {}
+        self._custom_table_original_names: dict[str, str] = {}
+        self._custom_table_original_rows: dict[str, list[dict[str, Any]]] = {}
+        for entry in data.get("customTables", []):
+            self._read_custom_table_entry(entry, ref_cache, raw_table_rows)
+        self._custom_tables: dict[str, CustomTable] = {}
+        self._custom_table_dirty: set[str] = set()
+        return raw_table_rows
+
+    def _resolve_custom_field_values(
+        self, data: dict[str, Any], ref_cache: ReferenceDataCache
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Resolve this level's custom-field array into a (mapping, values) pair.
+
+        ``mapping`` is original field name -> snake_case name, with collisions
+        resolved so names stay unique; ``values`` is snake_case name -> value.
+        """
+        # Resolve each definition once; the second pass reuses it.
+        resolved = [
+            (cf, ref_cache.get_custom_field(cf.get("customFieldId")))
+            for cf in data.get(self._custom_fields_key, [])
+        ]
+        original_names: list[str] = [
+            field_def.name for _cf, field_def in resolved if field_def
+        ]
+
+        name_mapping = resolve_snake_case_collisions(original_names)
+
+        values: dict[str, Any] = {}
+        for cf, field_def in resolved:
+            if not field_def:
+                continue
+            original_name = field_def.name
+            field_name = name_mapping.get(original_name, camel_to_snake(original_name))
+            values[field_name] = cf.get("value")
+
+        return name_mapping, values
+
+    def _read_custom_table_entry(
+        self,
+        entry: dict[str, Any],
+        ref_cache: ReferenceDataCache,
+        raw_table_rows: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Bucket one ``customTables`` entry under its snake_case table name.
+
+        One entry is one row. Layer overrides this because a layer entry may
+        instead carry a ``rows`` list.
+        """
+        table_id = entry.get("customTableDefinitionId")
+        table_def = ref_cache.get_custom_table(table_id)
+        if not table_def:
+            return
+        table_name = camel_to_snake(table_def.name or "")
+        raw_table_rows.setdefault(table_name, []).append(
+            ref_cache.build_custom_table_row(entry, table_id)
+        )
+        self._custom_table_original_names[table_name] = table_def.name
+        # Keep the original row: it carries id, sortOrder and the rest of the
+        # metadata a later save has to hand back.
+        self._custom_table_original_rows.setdefault(table_name, []).append(entry)
+
+    def _init_custom_metadata(
+        self,
+        ref_cache: ReferenceDataCache,
+        raw_table_rows: dict[str, list[dict[str, Any]]],
+    ) -> None:
+        """Build the info lists for every custom field and table at this level."""
+        level = self._custom_field_level
+        # Collect every name at this level first, so a collision resolves the
+        # same way whether or not this object carries a value for the field.
+        all_field_names = [
+            field_def["name"]
+            for field_def in ref_cache._custom_fields.values()
+            if field_def.get("level") == level
+        ]
+        all_field_mapping = resolve_snake_case_collisions(all_field_names)
+
+        self._custom_fields_info: list[dict[str, Any]] = []
+        for field_id, field_def in ref_cache._custom_fields.items():
+            if field_def.get("level") != level:
+                continue
+            original_name = field_def["name"]
+            self._custom_fields_info.append(
+                {
+                    "id": field_id,
+                    "name": original_name,
+                    "snake_case_name": all_field_mapping.get(
+                        original_name, camel_to_snake(original_name)
+                    ),
+                    "value_type": field_def.get("valueType"),
+                }
+            )
+        self._custom_fields_info.sort(key=lambda x: x["name"])
+        # __setattr__ tests every public write against this, so keep it a set
+        # rather than rescanning a list that grows with tenant configuration.
+        self._custom_field_snake_names = frozenset(
+            info["snake_case_name"] for info in self._custom_fields_info
+        )
+
+        self._custom_tables_info: list[dict[str, Any]] = []
+        for table_id, table_def in ref_cache._custom_tables.items():
+            if table_def.get("dataLevelId") not in self._custom_table_data_level_ids:
+                continue
             columns = ref_cache.get_custom_table_columns(table_id)
             column_names = [col["name"] for col in columns]
-            break
+            snake_name = camel_to_snake(table_def["name"])
 
-    new_table = CustomTable(
-        owner=owner,
-        ref_cache=ref_cache,
-        table_id=target_id,
-        snake_name=snake_name,
-        original_name=resolved_name,
-        column_names=column_names,
-        initial_rows=[],
-    )
-    custom_tables[snake_name] = new_table
-    custom_table_original_names.setdefault(snake_name, resolved_name)
+            if self._materialize_empty_tables or snake_name in raw_table_rows:
+                self._custom_tables[snake_name] = CustomTable(
+                    owner=self,
+                    ref_cache=ref_cache,
+                    table_id=table_id,
+                    snake_name=snake_name,
+                    original_name=table_def["name"],
+                    column_names=column_names,
+                    initial_rows=raw_table_rows.get(snake_name, []),
+                )
+                self._custom_table_original_names.setdefault(
+                    snake_name, table_def["name"]
+                )
 
-    if not any(info["snake_case_name"] == snake_name for info in custom_tables_info):
-        custom_tables_info.append(
-            {
-                "id": target_id,
-                "name": resolved_name,
-                "snake_case_name": snake_name,
-                "column_count": len(column_names),
-                "columns": column_names,
-            }
+            # The info list carries every declared table, rows or not.
+            self._custom_tables_info.append(
+                {
+                    "id": table_id,
+                    "name": table_def["name"],
+                    "snake_case_name": snake_name,
+                    "column_count": len(column_names),
+                    "columns": column_names,
+                }
+            )
+        self._custom_tables_info.sort(key=lambda x: x["name"])
+
+    # --- discovery --------------------------------------------------------
+
+    @property
+    def custom_fields_info(self) -> list[dict[str, Any]]:
+        """
+        List of all available custom fields at this level (read-only).
+
+        Returns metadata about every custom field defined for this object:
+        - id: Custom field ID
+        - name: Display name (as in Foundation)
+        - snake_case_name: Python-friendly attribute name
+        - value_type: Data type of the field
+
+        Example:
+            >>> for field in owner.custom_fields_info:   # a Program or a Layer
+            ...     print(f"{field['name']} -> {field['snake_case_name']}")
+        """
+        return self._custom_fields_info
+
+    @property
+    def custom_fields_names(self) -> list[str]:
+        """
+        List of all available custom field names at this level (read-only).
+
+        Returns a list of strings, where each string is the snake_case_name of a custom field.
+        Names are sorted alphabetically.
+
+        Example:
+            >>> owner.custom_fields_names                # a Program or a Layer
+            ['portfolio_tag', 'underwriter_notes']
+        """
+        return sorted([field["snake_case_name"] for field in self._custom_fields_info])
+
+    @property
+    def custom_tables_info(self) -> list[dict[str, Any]]:
+        """
+        List of all available custom tables at this level (read-only).
+
+        Returns metadata about every custom table defined for this object:
+        - id: Custom table ID
+        - name: Display name (as in Foundation)
+        - snake_case_name: Python-friendly attribute name
+        - column_count: Number of columns
+        - columns: List of column names
+
+        Example:
+            >>> for table in program.custom_tables_info:
+            ...     print(f"{table['name']}: {table['columns']}")
+        """
+        return self._custom_tables_info
+
+    @property
+    def custom_tables_names(self) -> list[str]:
+        """
+        List of all available custom table names at this level (read-only).
+
+        Returns a list of strings, where each string is the snake_case_name of a custom table.
+        Names are sorted alphabetically.
+
+        Example:
+            >>> owner.custom_tables_names                # a Program or a Layer
+            ['buffer_table_1', 'claims_history']
+        """
+        return sorted([table["snake_case_name"] for table in self._custom_tables_info])
+
+    # --- accessors --------------------------------------------------------
+
+    def get_custom_field(self, field_name: str) -> Any:
+        """
+        Get a custom field value by name (original name as defined in Foundation).
+
+        Args:
+            field_name: Custom field name as it appears in Foundation
+
+        Returns:
+            Custom field value, or None if not found
+
+        Example:
+            >>> owner.get_custom_field('Portfolio Tag')  # a Program or a Layer
+            'NewValue'
+        """
+        # Use the collision-aware mapping
+        snake_name = self._custom_field_name_mapping.get(field_name)
+        if snake_name:
+            value = self._custom_field_values.get(snake_name)
+            if self._parse_custom_field_datetimes:
+                return parse_datetime_string(value)
+            return value
+
+        # Not found
+        return None
+
+    def set_custom_field(self, field_name: str, value: Any) -> None:
+        """
+        Set a custom field value by name (snake_case).
+
+        Args:
+            field_name: Custom field name in snake_case (e.g., 'portfolio_tag')
+            value: Value to set
+
+        Example:
+            >>> owner.set_custom_field('portfolio_tag', 'NewValue')
+        """
+        self._require_writable(f"set custom field '{field_name}'")
+        parsed_value = parse_datetime_string(value)
+        self._modifications[field_name] = parsed_value
+
+    def get_custom_table(self, table_name: str) -> CustomTable:
+        """
+        Get a custom table wrapper by name (original name or snake_case).
+
+        The lookup chain, in order: an already-materialized table, then the info
+        list (which handles an on-the-fly rename), then the reference-cache
+        definition at this object's data level. Falls through to an empty
+        placeholder so a caller can always dot-access a declared table.
+
+        Args:
+            table_name: Custom table name as it appears in Foundation
+                (e.g., 'Claims History') or its snake_case form
+
+        Returns:
+            CustomTable instance for the requested table.
+
+        Example:
+            >>> claims_history = program.get_custom_table('Claims History')
+            >>> df = claims_history.as_pandas()
+            >>> df.head()
+        """
+        snake_name = camel_to_snake(table_name)
+        # `is not None`, not truthiness: CustomTable.__bool__ is row_count > 0, so a
+        # materialized table that happens to be empty is falsy and must not be
+        # mistaken for absent — rebuilding it would discard the live instance (and
+        # any edits already made through it).
+        table = self._custom_tables.get(snake_name)
+        if table is not None:
+            return table
+
+        for info in self._custom_tables_info:
+            if info["name"] == table_name or info["snake_case_name"] == snake_name:
+                existing = self._custom_tables.get(info["snake_case_name"])
+                if existing is not None:
+                    return existing
+                # Layers list every definition here but only materialize the ones
+                # the payload carried rows for, so a known-but-empty table lands
+                # in this branch and has to be built below under the names the
+                # info entry records.
+                table_name = info["name"]
+                snake_name = info["snake_case_name"]
+                break
+
+        target_id = None
+        column_names: list[str] = []
+        resolved_name = table_name
+        for table_id, table_def in self._ref_cache._custom_tables.items():
+            if table_def.get("dataLevelId") not in self._custom_table_data_level_ids:
+                continue
+            current_snake = camel_to_snake(table_def["name"])
+            if table_def["name"] == table_name or current_snake == snake_name:
+                target_id = table_id
+                resolved_name = table_def["name"]
+                snake_name = current_snake
+                columns = self._ref_cache.get_custom_table_columns(table_id)
+                column_names = [col["name"] for col in columns]
+                break
+
+        new_table = CustomTable(
+            owner=self,
+            ref_cache=self._ref_cache,
+            table_id=target_id,
+            snake_name=snake_name,
+            original_name=resolved_name,
+            column_names=column_names,
+            initial_rows=[],
         )
-        custom_tables_info.sort(key=lambda x: x["name"])
+        self._custom_tables[snake_name] = new_table
+        self._custom_table_original_names.setdefault(snake_name, resolved_name)
 
-    return new_table
+        if not any(
+            info["snake_case_name"] == snake_name for info in self._custom_tables_info
+        ):
+            self._custom_tables_info.append(
+                {
+                    "id": target_id,
+                    "name": resolved_name,
+                    "snake_case_name": snake_name,
+                    "column_count": len(column_names),
+                    "columns": column_names,
+                }
+            )
+            self._custom_tables_info.sort(key=lambda x: x["name"])
+
+        return new_table
+
+    def _mark_custom_table_modified(self, table_name: str) -> None:
+        """Mark a custom table as modified to include it in JSON output."""
+        self._custom_table_dirty.add(table_name)
+
+    def set_custom_table(
+        self, table_name: str, rows: Union[list[dict[str, Any]], "pd.DataFrame"]
+    ) -> None:
+        """
+        Set a custom table by name (accepts original name or snake_case).
+
+        Args:
+            table_name: Custom table name (e.g., 'Claims History' or 'claims_history')
+            rows: DataFrame or list of table rows (dicts with column names as keys)
+
+        Example:
+            >>> owner.set_custom_table('Claims History', [
+            ...     {'Valuation Date': '2024-01-15', 'Breakout': 'Property'}
+            ... ])
+        """
+        self._require_writable(f"set custom table '{table_name}'")
+        snake_name = camel_to_snake(table_name)
+        if snake_name in self._modifications:
+            del self._modifications[snake_name]
+        table = self.get_custom_table(table_name)
+        table.set_data(rows)
+
+    # --- name tests -------------------------------------------------------
+
+    def _is_custom_field_name(self, name: str) -> bool:
+        """Check if a name matches any custom field defined at this level.
+
+        _custom_field_values holds only the fields this object carries a value
+        for, so it cannot be the whole test: a field that exists but has never
+        been set must still be writable, and __setattr__ rejects names that
+        match nothing. _custom_field_snake_names is every declared name.
+        """
+        return (
+            name in self._custom_field_values or name in self._custom_field_snake_names
+        )
+
+    def _is_custom_table_name(self, name: str) -> bool:
+        """Check if a name matches any custom table."""
+        if name in self._custom_tables:
+            return True
+        return any(info["snake_case_name"] == name for info in self._custom_tables_info)
+
+    # --- document round-trip ----------------------------------------------
+
+    def _update_custom_field_in_json(
+        self, result: dict[str, Any], field_name: str, value: Any
+    ) -> None:
+        """Update a custom field value in this level's custom-field array."""
+        # Find the custom field ID using the collision-aware mapping
+        field_id = None
+        for original_name, snake_name in self._custom_field_name_mapping.items():
+            if snake_name == field_name:
+                # Found the original name, now get the field ID
+                for fid, field_def in self._ref_cache._custom_fields.items():
+                    if (
+                        field_def.get("level") == self._custom_field_level
+                        and field_def["name"] == original_name
+                    ):
+                        field_id = fid
+                        break
+                break
+
+        if field_id is None:
+            return
+
+        # Update or add the custom field in the array
+        custom_fields = result.get(self._custom_fields_key, [])
+        found = False
+        for cf in custom_fields:
+            if cf.get("customFieldId") == field_id:
+                cf["value"] = value
+                found = True
+                break
+
+        if not found:
+            # Add new custom field entry
+            custom_fields.append(
+                {
+                    "id": None,  # Will be assigned by API
+                    f"{self._owner_label}Id": result.get("id"),
+                    self._owner_label: None,
+                    "customFieldId": field_id,
+                    "customField": None,
+                    "value": value,
+                }
+            )
+            result[self._custom_fields_key] = custom_fields
+
+    def _find_custom_table_id(self, table_name: str) -> int | None:
+        """Resolve a snake_case table_name to its table id at this data level."""
+        for tid, table_def in self._ref_cache._custom_tables.items():
+            if table_def.get("dataLevelId") in self._custom_table_data_level_ids:
+                if camel_to_snake(table_def["name"]) == table_name:
+                    return tid
+        return None
+
+    def _build_column_mapping(
+        self, table_id: int
+    ) -> "tuple[dict[str, str], dict[str, int]]":
+        """Return (column_name -> raw-field-name, lookup-column-name -> accessible-object-id)."""
+        from ._custom_table_fields import LOOKUP_VALUE_TYPE, field_name_for_column
+
+        column_to_field: dict[str, str] = {}
+        lookup_columns: dict[str, int] = {}
+        for col in self._ref_cache.get_custom_table_columns(table_id):
+            field_name = field_name_for_column(col)
+            if field_name is None:
+                continue
+            col_name = col["name"]
+            column_to_field[col_name] = field_name
+            if col["valueType"] == LOOKUP_VALUE_TYPE:
+                lookup_object_id = col.get("lookupObjectId")
+                if lookup_object_id is not None:
+                    lookup_columns[col_name] = lookup_object_id
+        return column_to_field, lookup_columns
+
+    def _build_raw_table_row(
+        self,
+        table_id: int,
+        owner_id: Any,
+        sort_order: int,
+        original_rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Return a raw row dict, preserving id/metadata from the original if present."""
+        from ._custom_table_fields import initialize_blank_fields
+
+        if sort_order < len(original_rows):
+            raw_row = copy.deepcopy(original_rows[sort_order])
+            raw_row["sortOrder"] = sort_order
+            return raw_row
+
+        raw_row = {
+            "id": None,  # Will be assigned by API
+            "customTableDefinitionId": table_id,
+            "customTableDefinition": None,
+            "programId": None,
+            "layerId": None,
+            "layer": None,
+            "sortOrder": sort_order,
+        }
+        raw_row[f"{self._owner_label}Id"] = owner_id
+        initialize_blank_fields(raw_row)
+        return raw_row
+
+    def _apply_row_values(
+        self,
+        raw_row: dict[str, Any],
+        row_data: dict[str, Any],
+        column_to_field: dict[str, str],
+        lookup_columns: dict[str, int],
+    ) -> None:
+        """Project user values into the raw typed slots on ``raw_row``."""
+        for col_name, user_value in row_data.items():
+            field_name = column_to_field.get(col_name)
+            if not field_name:
+                continue
+            if col_name in lookup_columns and user_value is not None:
+                user_value = self._ref_cache.reverse_lookup_value(
+                    lookup_columns[col_name], user_value
+                )
+            if isinstance(user_value, (date, datetime)):
+                user_value = (
+                    to_wire_datetime(user_value)
+                    if isinstance(user_value, datetime)
+                    else f"{user_value}T00:00:00"
+                )
+            raw_row[field_name] = user_value
+
+    def _update_custom_table_in_json(
+        self, result: dict[str, Any], table_name: str, value: list[dict[str, Any]]
+    ) -> None:
+        """Update a custom table in the customTables array.
+
+        Converts user-friendly column names back to internal field names
+        (numValue1, textValue1, dateValue1, etc.) and maintains row order.
+        """
+        table_id = self._find_custom_table_id(table_name)
+        if table_id is None:
+            return
+
+        column_to_field, lookup_columns = self._build_column_mapping(table_id)
+        owner_id = result.get("id")
+        owner_id_key = f"{self._owner_label}Id"
+        original_rows = self._custom_table_original_rows.get(table_name, [])
+
+        # Drop existing rows for this owner + table, then rebuild in order.
+        custom_tables = [
+            ct
+            for ct in result.get("customTables", [])
+            if ct.get("customTableDefinitionId") != table_id
+            or ct.get(owner_id_key) != owner_id
+        ]
+        for sort_order, row_data in enumerate(value):
+            raw_row = self._build_raw_table_row(
+                table_id, owner_id, sort_order, original_rows
+            )
+            self._apply_row_values(raw_row, row_data, column_to_field, lookup_columns)
+            custom_tables.append(raw_row)
+
+        result["customTables"] = custom_tables
+
+    # --- dynamic attributes -----------------------------------------------
+
+    def __getattr__(self, name: str) -> Any:
+        """
+        Dynamic attribute access for custom fields and custom tables.
+
+        This enables dot notation access like:
+        - program.portfolio_tag (instead of program.get_custom_field('portfolio_tag'))
+        - program.buffer_table_1 (instead of program.get_custom_table('buffer_table_1'))
+
+        Args:
+            name: Attribute name in snake_case
+
+        Returns:
+            Attribute value
+
+        Raises:
+            AttributeError: If attribute not found
+        """
+        raise_if_private(self, name)
+
+        # Check custom fields (check modifications first)
+        if name in self._modifications:
+            return self._modifications[name]
+
+        if name in self._custom_field_values:
+            return self._custom_field_values[name]
+
+        # Check custom tables
+        if name in self._custom_tables:
+            return self._custom_tables[name]
+
+        raise AttributeError(
+            f"'{self.__class__.__name__}' object has no attribute '{name}'"
+        )
+
+    def _set_extra_attribute(self, name: str, value: Any) -> bool:
+        """Hook for a subclass's own dynamic names; True if it took the write.
+
+        Runs after the property and custom-table checks and before the
+        custom-field one. Layer uses it for limits, attachments and premiums.
+        """
+        return False
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """
+        Dynamic attribute setting for custom fields and custom tables.
+
+        This enables dot notation assignment like:
+        - program.portfolio_tag = "NewValue"
+
+        Args:
+            name: Attribute name in snake_case
+            value: Value to set
+        """
+        # Internal attributes (prefixed with _) are set directly
+        if name.startswith("_"):
+            super().__setattr__(name, value)
+            return
+
+        self._require_writable(f"set '{name}'")
+
+        # Check if it's a defined property with a setter
+        prop = getattr(type(self), name, None)
+        if isinstance(prop, property):
+            if prop.fset is None:
+                raise AttributeError(
+                    f"'{name}' is read-only on {self.__class__.__name__}."
+                )
+            prop.fset(self, value)
+            # Property setter already handles modifications
+            return
+
+        if self._is_custom_table_name(name):
+            self.set_custom_table(name, value)
+            return
+
+        if self._set_extra_attribute(name, value):
+            return
+
+        # An unrecognised name used to be recorded as a modification, camelCased
+        # by get_json() and sent as part of the deal document, so a misspelling
+        # changed the document while the real field kept its value. The document
+        # holds far more fields than the classes expose as properties, and
+        # writing one has always been how a caller edits it, so a name matching
+        # a key actually present is accepted; a misspelling matches no key.
+        if (
+            not self._is_custom_field_name(name)
+            and snake_to_camel(name) not in self._data
+        ):
+            raise AttributeError(
+                f"'{type(self).__name__}' has no attribute or custom field '{name}'. "
+                f"Use {self._owner_label}.custom_fields_info to list the names it accepts."
+            )
+
+        parsed_value = parse_datetime_string(value)
+        self._modifications[name] = parsed_value
