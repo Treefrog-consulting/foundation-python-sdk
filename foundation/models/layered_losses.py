@@ -11,9 +11,19 @@ if TYPE_CHECKING:
     from .run_configuration import RunConfiguration
 
 
+_LAYERED_LOSSES_COLUMNS = (
+    "year, sequence, event_id, region_id, peril_id, model_id, "
+    "loss, rip_amt, rip_pct, rip_brok_amt, rip_brok_pct"
+)
+
 _LAYERED_LOSSES_SELECT = (
-    "SELECT year, sequence, event_id, region_id, peril_id, model_id, "
-    "loss, rip_amt, rip_pct, rip_brok_amt, rip_brok_pct "
+    f"SELECT {_LAYERED_LOSSES_COLUMNS}, lob FROM layered_losses WHERE layer_id = ?"
+)
+
+# A DuckDB exported by a pre-#3642 server has no lob column; selecting a typed
+# NULL keeps the frame shape identical, so old exports simply return lob=None.
+_LAYERED_LOSSES_SELECT_NO_LOB = (
+    f"SELECT {_LAYERED_LOSSES_COLUMNS}, CAST(NULL AS INTEGER) AS lob "
     "FROM layered_losses WHERE layer_id = ?"
 )
 
@@ -44,7 +54,8 @@ class LayeredLosses(_LossExportAccessor):
         Returns:
             Polars DataFrame with layered losses for this layer.
             Columns: year, sequence, event_id, region_id, peril_id, model_id,
-                    loss, rip_amt, rip_pct, rip_brok_amt, rip_brok_pct.
+                    loss, rip_amt, rip_pct, rip_brok_amt, rip_brok_pct, lob.
+            lob is null for losses without a line of business.
 
         Raises:
             ImportError: If polars is not installed.
@@ -65,8 +76,20 @@ class LayeredLosses(_LossExportAccessor):
         return super().as_pandas(run_config)
 
     def _read_frame(self, con: Any, format_method: str) -> Any:
-        query = con.execute(_LAYERED_LOSSES_SELECT, [self._layer.id])
+        select = (
+            _LAYERED_LOSSES_SELECT
+            if self._has_lob_column(con)
+            else _LAYERED_LOSSES_SELECT_NO_LOB
+        )
+        query = con.execute(select, [self._layer.id])
         return getattr(query, format_method)()
+
+    @staticmethod
+    def _has_lob_column(con: Any) -> bool:
+        rows = con.execute(
+            "SELECT 1 FROM pragma_table_info('layered_losses') WHERE name = 'lob'"
+        ).fetchall()
+        return bool(rows)
 
     def describe(self) -> None:
         """Display a summary of this LayeredLosses accessor.

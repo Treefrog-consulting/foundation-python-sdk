@@ -22,7 +22,6 @@ from ..ref_data import ReferenceDataCache
 from ..utils import (
     camel_to_snake,
     parse_datetime_string,
-    resolve_snake_case_collisions,
     snake_to_camel,
     to_wire_datetime,
 )
@@ -44,6 +43,22 @@ def raise_if_private(owner: Any, name: str) -> None:
         raise AttributeError(
             f"'{type(owner).__name__}' object has no attribute '{name}'"
         )
+
+
+def raise_read_only(owner: Any, name: str, value: Any, what: str) -> None:
+    """Take a ``_``-prefixed write; refuse every public one.
+
+    The write-side companion to :func:`raise_if_private`, for the same dynamic
+    accessors. Assignment on one of those used to create a plain instance
+    attribute that shadowed ``__getattr__``, so the value read back while the
+    deal document -- and every metric computed from it -- kept the original.
+    """
+    if name.startswith("_"):
+        object.__setattr__(owner, name, value)
+        return
+    raise AttributeError(
+        f"'{type(owner).__name__}' is read-only: {what} cannot be set through the SDK."
+    )
 
 
 class CustomDataMixin:
@@ -77,6 +92,13 @@ class CustomDataMixin:
     #: A legacy divergence preserved deliberately, not a choice a new owner
     #: should have to make -- the two classes simply grew apart.
     _materialize_empty_tables: ClassVar[bool]
+    #: Document keys :meth:`get_json` rebuilds from this object's own state, so
+    #: a raw write to one is either overwritten or, for ``layers``, left
+    #: inconsistent with the models get_json walks -- ``program.layers`` and
+    #: ``get_json()["layers"]`` would disagree on length and raise IndexError.
+    _MANAGED_DOCUMENT_KEYS: ClassVar[frozenset[str]] = frozenset(
+        {"layers", "customTables", "programCustomFields", "layerCustomFields"}
+    )
     #: Whether :meth:`get_custom_field` parses timestamp strings into
     #: datetimes. Layer does; Program returns the stored value unchanged.
     #: Also a legacy divergence: Program was never given the parse. Changing
@@ -130,9 +152,7 @@ class CustomDataMixin:
         :meth:`_init_custom_metadata` needs. The two halves are separate calls
         because each class builds state of its own in between.
         """
-        self._custom_field_name_mapping, self._custom_field_values = (
-            self._resolve_custom_field_values(data, ref_cache)
-        )
+        self._custom_field_values = self._resolve_custom_field_values(data, ref_cache)
 
         raw_table_rows: dict[str, list[dict[str, Any]]] = {}
         self._custom_table_original_names: dict[str, str] = {}
@@ -145,32 +165,19 @@ class CustomDataMixin:
 
     def _resolve_custom_field_values(
         self, data: dict[str, Any], ref_cache: ReferenceDataCache
-    ) -> tuple[dict[str, str], dict[str, Any]]:
-        """Resolve this level's custom-field array into a (mapping, values) pair.
-
-        ``mapping`` is original field name -> snake_case name, with collisions
-        resolved so names stay unique; ``values`` is snake_case name -> value.
-        """
-        # Resolve each definition once; the second pass reuses it.
-        resolved = [
-            (cf, ref_cache.get_custom_field(cf.get("customFieldId")))
-            for cf in data.get(self._custom_fields_key, [])
-        ]
-        original_names: list[str] = [
-            field_def.name for _cf, field_def in resolved if field_def
-        ]
-
-        name_mapping = resolve_snake_case_collisions(original_names)
+    ) -> dict[str, Any]:
+        """Resolve this level's custom-field array into snake_case name -> value."""
+        snake_by_id = ref_cache.custom_field_snake_map(self._custom_field_level)
 
         values: dict[str, Any] = {}
-        for cf, field_def in resolved:
-            if not field_def:
-                continue
-            original_name = field_def.name
-            field_name = name_mapping.get(original_name, camel_to_snake(original_name))
-            values[field_name] = cf.get("value")
+        for cf in data.get(self._custom_fields_key, []):
+            # A row naming a definition this level does not carry belongs to
+            # another level and has no attribute here.
+            field_name = snake_by_id.get(cf.get("customFieldId"))
+            if field_name is not None:
+                values[field_name] = cf.get("value")
 
-        return name_mapping, values
+        return values
 
     def _read_custom_table_entry(
         self,
@@ -203,30 +210,19 @@ class CustomDataMixin:
     ) -> None:
         """Build the info lists for every custom field and table at this level."""
         level = self._custom_field_level
-        # Collect every name at this level first, so a collision resolves the
-        # same way whether or not this object carries a value for the field.
-        all_field_names = [
-            field_def["name"]
-            for field_def in ref_cache._custom_fields.values()
-            if field_def.get("level") == level
-        ]
-        all_field_mapping = resolve_snake_case_collisions(all_field_names)
+        # The same map the values were keyed by, so a collision resolves one
+        # way whether or not this object carries a value for the field.
+        snake_by_id = ref_cache.custom_field_snake_map(level)
 
-        self._custom_fields_info: list[dict[str, Any]] = []
-        for field_id, field_def in ref_cache._custom_fields.items():
-            if field_def.get("level") != level:
-                continue
-            original_name = field_def["name"]
-            self._custom_fields_info.append(
-                {
-                    "id": field_id,
-                    "name": original_name,
-                    "snake_case_name": all_field_mapping.get(
-                        original_name, camel_to_snake(original_name)
-                    ),
-                    "value_type": field_def.get("valueType"),
-                }
-            )
+        self._custom_fields_info: list[dict[str, Any]] = [
+            {
+                "id": field_id,
+                "name": field_def.get("name") or "",
+                "snake_case_name": snake_by_id[field_id],
+                "value_type": field_def.get("valueType"),
+            }
+            for field_id, field_def in ref_cache.custom_field_definitions(level).items()
+        ]
         self._custom_fields_info.sort(key=lambda x: x["name"])
         # __setattr__ tests every public write against this, so keep it a set
         # rather than rescanning a list that grows with tenant configuration.
@@ -335,6 +331,109 @@ class CustomDataMixin:
 
     # --- accessors --------------------------------------------------------
 
+    def get_document_field(self, name: str) -> Any:
+        """
+        Read a raw deal-document field the SDK exposes no property for.
+
+        The escape hatch for the parts of the document the SDK has not modelled
+        -- ``layer_participants``, ``layer_reinst``, ``program_loss_groups`` and
+        the rest. Values come back in the server's own shape (lists of dicts,
+        camelCase keys, timestamps as strings), which is not a stable contract:
+        prefer a property where one exists.
+
+        Args:
+            name: Field name in snake_case, e.g. "layer_participants"
+
+        Returns:
+            The value, with any edit made through set_document_field applied.
+
+        Raises:
+            AttributeError: If the document carries no such field
+
+        Example:
+            >>> layer.get_document_field("layer_participants")
+            [{'id': 88, 'participantId': 10, 'share1': 0.1, ...}]
+        """
+        # The document check comes first so this method and set_document_field
+        # accept the same names: a custom field carries a modification too, and
+        # answering it here would serve a name the setter rejects.
+        key = self._document_key(name)
+        if key is None:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no document field '{name}'."
+            )
+        if name in self._modifications:
+            return self._modifications[name]
+        return self._data[key]
+
+    def set_document_field(self, name: str, value: Any) -> None:
+        """
+        Edit a raw deal-document field the SDK exposes no property for.
+
+        This is how a what-if scenario changes something the SDK has not
+        modelled -- a layer's participants or reinstatements, a deal's loss
+        groups. Until 0.13 the same edit was made by plain assignment, which
+        also silently accepted names that were not document fields at all.
+
+        The edit is local. The SDK has no endpoint that saves a deal, so it
+        changes only the document posted for layered_losses, ylt and
+        metric_results -- never the stored deal.
+
+        Args:
+            name: Field name in snake_case, e.g. "layer_participants"
+            value: Replacement value, in the server's own shape
+
+        Raises:
+            AttributeError: If the document carries no such field
+            ReadOnlyVersionError: If this object is a past version
+
+        Example:
+            >>> layer.set_document_field(
+            ...     "layer_participants", [{"participantId": 10, "share1": 0.25}]
+            ... )
+            >>> layer.layered_losses.as_pandas(run_config)   # reflects the edit
+        """
+        self._require_writable(f"set document field '{name}'")
+        if snake_to_camel(name) in self._MANAGED_DOCUMENT_KEYS:
+            raise AttributeError(
+                f"'{name}' is rebuilt by get_json() from this object's own state "
+                f"and cannot be set as a raw document field. Edit it through "
+                f"{self._owner_label}.layers, set_custom_field() or "
+                f"set_custom_table() instead."
+            )
+        if self._document_key(name) is None:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no document field '{name}'. "
+                f"It holds: {', '.join(self._settable_document_names())}"
+            )
+        self._modifications[name] = value
+
+    def _document_key(self, name: str) -> str | None:
+        """The document key a snake_case name refers to, or None.
+
+        The camelCase fold is tried first, then the document's own keys are
+        folded back: snake_to_camel lowercases a trailing acronym run, so
+        ``dcf_id`` becomes ``dcfId`` and would never find a ``dcfID`` key that
+        camel_to_snake nonetheless names ``dcf_id``.
+        """
+        camel_name = snake_to_camel(name)
+        if camel_name in self._MANAGED_DOCUMENT_KEYS:
+            return None
+        if camel_name in self._data:
+            return camel_name
+        for key in self._data:
+            if key not in self._MANAGED_DOCUMENT_KEYS and camel_to_snake(key) == name:
+                return key
+        return None
+
+    def _settable_document_names(self) -> list[str]:
+        """Every name set_document_field accepts, sorted."""
+        return sorted(
+            camel_to_snake(key)
+            for key in self._data
+            if key not in self._MANAGED_DOCUMENT_KEYS
+        )
+
     def get_custom_field(self, field_name: str) -> Any:
         """
         Get a custom field value by name (original name as defined in Foundation).
@@ -349,8 +448,16 @@ class CustomDataMixin:
             >>> owner.get_custom_field('Portfolio Tag')  # a Program or a Layer
             'NewValue'
         """
-        # Use the collision-aware mapping
-        snake_name = self._custom_field_name_mapping.get(field_name)
+        # _custom_fields_info carries this level's definitions, so it answers
+        # both directions the collision-aware name mapping used to.
+        snake_name = next(
+            (
+                info["snake_case_name"]
+                for info in self._custom_fields_info
+                if info["name"] == field_name
+            ),
+            None,
+        )
         if snake_name:
             value = self._custom_field_values.get(snake_name)
             if self._parse_custom_field_datetimes:
@@ -513,20 +620,14 @@ class CustomDataMixin:
         self, result: dict[str, Any], field_name: str, value: Any
     ) -> None:
         """Update a custom field value in this level's custom-field array."""
-        # Find the custom field ID using the collision-aware mapping
-        field_id = None
-        for original_name, snake_name in self._custom_field_name_mapping.items():
-            if snake_name == field_name:
-                # Found the original name, now get the field ID
-                for fid, field_def in self._ref_cache._custom_fields.items():
-                    if (
-                        field_def.get("level") == self._custom_field_level
-                        and field_def["name"] == original_name
-                    ):
-                        field_id = fid
-                        break
-                break
-
+        field_id = next(
+            (
+                info["id"]
+                for info in self._custom_fields_info
+                if info["snake_case_name"] == field_name
+            ),
+            None,
+        )
         if field_id is None:
             return
 
@@ -746,19 +847,25 @@ class CustomDataMixin:
         if self._set_extra_attribute(name, value):
             return
 
-        # An unrecognised name used to be recorded as a modification, camelCased
-        # by get_json() and sent as part of the deal document, so a misspelling
-        # changed the document while the real field kept its value. The document
-        # holds far more fields than the classes expose as properties, and
-        # writing one has always been how a caller edits it, so a name matching
-        # a key actually present is accepted; a misspelling matches no key.
-        if (
-            not self._is_custom_field_name(name)
-            and snake_to_camel(name) not in self._data
-        ):
+        # Only a property, a custom field or a custom table is writable. Until
+        # 0.13 any name whose camelCase form was a key in the deal document was
+        # accepted too, which made the write half of the surface wider than the
+        # read half: `program.renewed_from_id = 1460` was taken and the matching
+        # read raised AttributeError. A name genuinely worth setting now has a
+        # property; the rest of the document is reachable through
+        # get_document_field / set_document_field, which read and write the same
+        # names as each other.
+        if not self._is_custom_field_name(name):
+            hint = (
+                f" Use {self._owner_label}.set_document_field('{name}', ...) to "
+                "edit the raw document field of that name."
+                if snake_to_camel(name) in self._data
+                else ""
+            )
             raise AttributeError(
-                f"'{type(self).__name__}' has no attribute or custom field '{name}'. "
-                f"Use {self._owner_label}.custom_fields_info to list the names it accepts."
+                f"'{type(self).__name__}' has no settable attribute or custom "
+                f"field '{name}'. Use {self._owner_label}.custom_fields_info to "
+                f"list the custom-field names it accepts.{hint}"
             )
 
         parsed_value = parse_datetime_string(value)

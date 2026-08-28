@@ -10,7 +10,7 @@ import requests
 from ..exceptions import raise_for_status
 from ..sys_config import SysConfigCache
 from ..utils import camel_to_snake, ref_values
-from ._init_helpers import raise_if_private
+from ._init_helpers import raise_if_private, raise_read_only
 from ._reference_tables import REFERENCE_TABLES
 
 if TYPE_CHECKING:
@@ -96,6 +96,18 @@ class FoundationClient:
         # change, and each miss costs the server a full history rebuild, so a
         # loop over versions must not re-request one it has already read.
         self._versioned_programs: dict[tuple[int, int], dict[str, Any]] = {}
+
+    #: The only attributes a caller may assign. Everything else public on this
+    #: class is a reference table, a module custom table or a method, and a
+    #: write to one used to shadow it silently for the rest of the session.
+    _SETTABLE: ClassVar[frozenset[str]] = frozenset({"base_url", "timeout"})
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Take an internal or configurable write; refuse the rest."""
+        if name in self._SETTABLE:
+            object.__setattr__(self, name, value)
+            return
+        raise_read_only(self, name, value, "reference data and module tables")
 
     def _api_url(self, module: str, path: str) -> str:
         """Build an absolute URL for the given Foundation module and path."""
@@ -186,8 +198,8 @@ class FoundationClient:
         from .module_custom_table import ModuleCustomTable
         from .reference_runs import ReferenceRuns
 
-        # All seven calls are mutually independent — fetch in parallel to save
-        # ~6x RTT on authenticate(). Accessible-objects is a follow-on of
+        # All nine calls are mutually independent — fetch in parallel to save
+        # ~8x RTT on authenticate(). Accessible-objects is a follow-on of
         # deal_ref (needs its lookupObjectIds) and stays sequential below.
         endpoints = {
             "deal_ref": ("deal", "/api/ref"),
@@ -197,6 +209,8 @@ class FoundationClient:
             "reference_runs": ("deal", "/api/referenceRuns"),
             "loss_ref": ("loss", "/api/ref"),
             "sys_configs": ("loss", "/api/SysConfigs"),
+            "roles": ("identity", "/api/Roles"),
+            "users": ("identity", "/api/Users"),
         }
 
         with ThreadPoolExecutor(max_workers=len(endpoints)) as executor:
@@ -229,6 +243,21 @@ class FoundationClient:
             "Loss-set upload will not function until SysConfig is reachable",
             default=[],
         )
+        # A deal's roles still resolve without these -- ProgramRole falls back
+        # to the raw GUIDs -- so a failure here degrades rather than aborts.
+        roles_data = result_or_warn(
+            "roles",
+            "Failed to load Identity roles from /api/Roles. program.roles will "
+            "carry only the rows each deal stores, with no role names, so "
+            "lookup by name will not find them",
+            default=[],
+        )
+        users_data = result_or_warn(
+            "users",
+            "Failed to load Identity users from /api/Users. "
+            "program.roles will report user IDs but not names",
+            default=[],
+        )
 
         # Accessible objects depend on deal_ref's column definitions.
         accessible_objects_data = self._load_accessible_objects(deal_ref_data)
@@ -239,6 +268,8 @@ class FoundationClient:
             common_ref_data,
             accessible_objects_data,
             loss_ref_data=loss_ref_data,
+            roles_data=roles_data,
+            users_data=users_data,
         )
 
         self._layer_headers = {
@@ -493,6 +524,16 @@ class FoundationClient:
         return self._reference("participant_statuses")
 
     @property
+    def roles(self) -> "ReferenceTable":
+        """Identity roles. Deals assign the ones flagged program_role_flag."""
+        return self._reference("roles")
+
+    @property
+    def users(self) -> "ReferenceTable":
+        """Identity users."""
+        return self._reference("users")
+
+    @property
     def tokens(self) -> "ReferenceTable":
         """UI tokens."""
         return self._reference("tokens")
@@ -620,6 +661,11 @@ class FoundationClient:
     def regions(self) -> "ReferenceTable":
         """Regions. Look up by code with ``by_code["NA"]``."""
         return self._reference("regions")
+
+    @property
+    def lobs(self) -> "ReferenceTable":
+        """Lines of business. Resolves the ``lob`` column of layered losses."""
+        return self._reference("lobs")
 
     @property
     def models(self) -> "ReferenceTable":
@@ -795,7 +841,7 @@ class FoundationClient:
             >>> print(program.uw_year)
 
             >>> previous = client.get_program(2455, version_id=23011)
-            >>> print(previous.layers[0].collateral_req_share)
+            >>> print(previous.layers[0].get_document_field("collateral_req_share"))
         """
         from .program import Program
 
@@ -873,7 +919,7 @@ class FoundationClient:
             >>> print(layer.incept_date)
 
             >>> previous = client.get_layer(10581, version_id=23011)
-            >>> print(previous.collateral_req_share)
+            >>> print(previous.get_document_field("collateral_req_share"))
         """
 
         # Find the program ID for this layer

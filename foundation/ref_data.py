@@ -3,7 +3,14 @@
 from collections.abc import Callable
 from typing import Any
 
-from .models._reference_tables import CLIENTS, COMMON, DEAL, LOSS, REFERENCE_TABLES
+from .models._reference_tables import (
+    CLIENTS,
+    COMMON,
+    DEAL,
+    IDENTITY,
+    LOSS,
+    REFERENCE_TABLES,
+)
 from .models.base import BaseModel
 from .models.broker import Broker
 from .models.broker_office import BrokerOffice
@@ -26,10 +33,31 @@ from .models.perspective import Perspective
 from .models.reference_table import ReferenceTable
 from .models.region import Region
 from .models.reinst_prem_base import ReinstPremBase
+from .models.role import Role
 from .models.unit_of_measure import UnitOfMeasure
+from .models.user import User
 from .models.variant import Variant
 from .models.vendor import Vendor
-from .utils import parse_datetime_string, ref_values
+from .utils import (
+    camel_to_snake,
+    claim_unique_name,
+    parse_datetime_string,
+    ref_values,
+)
+
+#: Which definition levels a Program (1) or a Layer (2) carries, mirroring the
+#: server's CustomFieldLevel enum: ProgramAndLayer (3) belongs to both, and
+#: LayerAndEcon (4) to the layer. Ylt (5) reaches neither.
+_DEFINITION_LEVELS = {
+    1: frozenset({1, 3}),
+    2: frozenset({2, 3, 4}),
+}
+
+#: The levels this release knows how to place. A definition carrying anything
+#: else -- a level the platform adds later, or none at all -- is offered to
+#: both objects rather than dropped: over-reporting a field is recoverable,
+#: silently losing the value a deal stores for it is not.
+_KNOWN_DEFINITION_LEVELS = frozenset({1, 2, 3, 4, 5})
 
 
 class ReferenceDataCache:
@@ -42,6 +70,8 @@ class ReferenceDataCache:
         common_ref_data: dict[str, Any],
         accessible_objects_data: dict[str, Any] | None = None,
         loss_ref_data: dict[str, Any] | None = None,
+        roles_data: list[dict[str, Any]] | None = None,
+        users_data: list[dict[str, Any]] | None = None,
     ):
         """
         Initialize the reference data cache.
@@ -52,6 +82,8 @@ class ReferenceDataCache:
             common_ref_data: Reference data from Common Module /api/ref endpoint
             accessible_objects_data: Accessible object definitions and values for lookup field resolution
             loss_ref_data: Reference data from Loss Module /api/ref endpoint
+            roles_data: Roles from the Identity Module /api/Roles endpoint
+            users_data: Users from the Identity Module /api/Users endpoint
         """
         self._deal_ref = deal_ref_data or {}
         self._common_ref = common_ref_data or {}
@@ -130,14 +162,31 @@ class ReferenceDataCache:
             COMMON: self._common_ref,
             LOSS: loss_ref,
             CLIENTS: {"clients": {"values": clients_data or []}},
+            IDENTITY: {
+                "roles": {"values": roles_data or []},
+                "users": {"values": users_data or []},
+            },
         }
         self._vendors = self._index_values(ref_values(loss_ref, "vendor"))
         self._variants = self._index_values(ref_values(loss_ref, "variant"))
         self._perspectives = self._index_values(ref_values(loss_ref, "perspective"))
         self._event_sets = self._index_values(ref_values(loss_ref, "eventSet"))
 
+        # Identity roles and users. Their ids are GUID strings rather than ints;
+        # _index_values folds string keys and _lookup_ref tries the id index
+        # before the name one, so a GUID resolves like any other identifier.
+        self._roles = self._index_values(roles_data or [])
+        self._users = self._index_values(users_data or [])
+
         # Reference tables are built on first access and kept for the session.
         self._ref_tables: dict[str, ReferenceTable] = {}
+        self._category_snake_names: dict[Any, str] | None = None
+        self._category_snake_claimed: set[str] = set()
+        self._custom_field_snake_maps: dict[int, dict[Any, str]] = {}
+        self._custom_field_definitions: dict[int, dict[Any, dict[str, Any]]] = {}
+        self._custom_table_columns_by_table: dict[Any, list[dict[str, Any]]] | None = (
+            None
+        )
 
     def reference_table(self, name: str) -> ReferenceTable:
         """
@@ -325,21 +374,30 @@ class ReferenceDataCache:
 
     def _lookup(
         self,
-        identifier: int | str,
-        by_id: dict[int, dict[str, Any]],
+        identifier: int | str | None,
+        by_id: dict[Any, dict[str, Any]],
         model_cls: Callable[[dict[str, Any]], Any],
     ) -> Any | None:
         """Resolve a reference row by ID, code or name and wrap it in a model."""
-        return self._lookup_ref(identifier, by_id, self._string_index(by_id), model_cls)
+        return self._lookup_ref(
+            identifier, by_id, self._string_index(by_id, model_cls), model_cls
+        )
 
     def _string_index(
-        self, by_id: dict[int, dict[str, Any]]
+        self,
+        by_id: dict[Any, dict[str, Any]],
+        model_cls: Callable[[dict[str, Any]], Any],
     ) -> dict[str, dict[str, Any]]:
-        """Return a case-insensitive code+name index for a reference table.
+        """Return a case-insensitive name+code+email index for a reference table.
 
-        Built on first lookup and kept. A row is reachable by either its code or
-        its name. Code wins a collision, which preserves the code-keyed lookups
-        that shipped before names were accepted (get_peril("EQ"), get_region("NA")).
+        Built on first lookup and kept. A row is reachable by its name, its code
+        or its email. Code wins a collision, which preserves the code-keyed
+        lookups that shipped before names were accepted (get_peril("EQ"),
+        get_region("NA")).
+
+        The name comes from the model rather than the payload: an Identity user
+        record carries no ``name`` key and assembles one from its first and last,
+        so indexing the raw field would leave every user unreachable by name.
 
         Cached against the identity of the by-ID dict rather than a hand-written
         key, so an index can never be served for the wrong table. Those dicts are
@@ -349,8 +407,18 @@ class ReferenceDataCache:
         cached = self._string_indexes.get(id(by_id))
         if cached is None:
             rows = list(by_id.values())
+            by_name = self._index_by_field(rows, "name")
+            # Only a row carrying no "name" needs its model built: an Identity
+            # user record has none and assembles one from its first and last.
+            # Every other table answers from the raw key, as it always did.
+            for row in rows:
+                if row.get("name") is None:
+                    name = getattr(model_cls(row), "name", None)
+                    if isinstance(name, str) and name:
+                        by_name[name.lower()] = row
             cached = {
-                **self._index_by_field(rows, "name"),
+                **by_name,
+                **self._index_by_field(rows, "email"),
                 **self._index_by_field(rows, "code"),
             }
             self._string_indexes[id(by_id)] = cached
@@ -472,17 +540,138 @@ class ReferenceDataCache:
         """Get category detail by ID, code or name (case-insensitive)."""
         return self._lookup(identifier, self._category_details, CategoryDetail)
 
+    def active_categories(self) -> list[Category]:
+        """Every category a deal can carry, in the platform's display order.
+
+        A deal's Categories panel lists these whether or not the deal sets them,
+        so ProgramCategories seeds itself from this rather than from the deal's
+        own rows.
+        """
+        return self._active_in_display_order("categories")
+
+    def category_snake_name(self, category: Category) -> str:
+        """The attribute name a category is reachable under.
+
+        Keyed by category ID, not by display name: two categories can carry the
+        same name, and two different names can snake_case alike ("Loss Trigger"
+        and "loss-trigger"). Either way the second gets a numeric suffix, the way
+        custom fields resolve theirs -- keying by name would instead merge two
+        categories' values into one attribute.
+
+        Every active category is registered on first use and held for the
+        session; a category a deal assigns after the platform retired it is
+        registered on demand, and keeps the name it was given.
+        """
+        if self._category_snake_names is None:
+            self._category_snake_names = {}
+            self._category_snake_claimed = set()
+            for active in self.active_categories():
+                self._register_category_name(active)
+        known = self._category_snake_names.get(category.id)
+        return known if known is not None else self._register_category_name(category)
+
+    def custom_field_definitions(self, level: int) -> dict[Any, dict[str, Any]]:
+        """The custom-field definitions a Program (1) or Layer (2) carries.
+
+        A definition's level says which object holds it, and two of them belong
+        to both: the server puts a ProgramAndLayer field in a deal's array and
+        in every layer's, and a LayerAndEcon field in the layer's. Matching the
+        level exactly would drop those, so the rule is written once here rather
+        than at each of the places that filters definitions.
+
+        Held for the session, like the map built from it: the definitions do
+        not change under the cache, and a deal's every layer would otherwise
+        rebuild the same dict.
+        """
+        known = self._custom_field_definitions.get(level)
+        if known is None:
+            wanted = _DEFINITION_LEVELS.get(level, frozenset({level}))
+            known = {
+                field_id: field_def
+                for field_id, field_def in self._custom_fields.items()
+                if (field_def.get("level") in wanted)
+                or (field_def.get("level") not in _KNOWN_DEFINITION_LEVELS)
+            }
+            self._custom_field_definitions[level] = known
+        return known
+
+    def custom_field_snake_map(self, level: int) -> dict[Any, str]:
+        """Custom-field id -> snake_case name, for one level.
+
+        Keyed by id, not by name: merging the levels above lets two definitions
+        share a name, which the platform allows because its uniqueness index is
+        on the name and level together. Keying by name would hand both fields
+        one attribute and lose a value, the way categories would without
+        :meth:`category_snake_name`.
+
+        Resolved over every definition the level carries rather than the subset
+        a deal happens to hold, so a collision lands on the same name for every
+        deal and the name a value is stored under is the one
+        ``custom_fields_info`` advertises. Held for the session: the
+        definitions do not change under it, and a deal's every layer would
+        otherwise rebuild the same map.
+        """
+        known = self._custom_field_snake_maps.get(level)
+        if known is None:
+            claimed: set[str] = set()
+            # Sorted by id so the suffix a collision gets does not depend on
+            # the order the server happened to return the definitions in.
+            known = {
+                field_id: claim_unique_name(
+                    camel_to_snake(field_def.get("name") or ""), claimed
+                )
+                for field_id, field_def in sorted(
+                    self.custom_field_definitions(level).items()
+                )
+            }
+            self._custom_field_snake_maps[level] = known
+        return known
+
+    def _register_category_name(self, category: Category) -> str:
+        """Claim a unique attribute name for a category and remember it."""
+        resolved = claim_unique_name(
+            camel_to_snake(category.name or ""), self._category_snake_claimed
+        )
+        self._category_snake_names[category.id] = resolved
+        return resolved
+
+    def _active_in_display_order(
+        self, table: str, predicate: Callable[[Any], Any] | None = None
+    ) -> list[Any]:
+        """Active rows of a reference table, sorted by the platform's sort order.
+
+        Reads the session-cached ReferenceTable, which already drops inactive
+        rows and wraps each in its model, rather than rebuilding both per deal.
+        Returns a new list every call, so a caller cannot disturb that cache.
+        """
+        return sorted(
+            (
+                row
+                for row in self.reference_table(table)
+                if predicate is None or predicate(row)
+            ),
+            key=lambda row: row.sort_order or 0,
+        )
+
     def get_external_ref_type(self, identifier: int | str) -> ExternalRefType | None:
         """Get external ref type by ID or name (case-insensitive)."""
         return self._lookup(identifier, self._external_ref_types, ExternalRefType)
 
     def get_custom_table_columns(self, table_id: int) -> list[dict[str, Any]]:
-        """Get column definitions for a custom table."""
-        return [
-            col
-            for col in self._custom_table_columns
-            if col.get("customTableDefinitionId") == table_id
-        ]
+        """Get column definitions for a custom table.
+
+        Grouped on first use: every Program and Layer asks for each of its
+        tables, so scanning the whole column list per table meant re-reading
+        every definition in the tenant once per table per object.
+        """
+        if self._custom_table_columns_by_table is None:
+            grouped: dict[Any, list[dict[str, Any]]] = {}
+            for col in self._custom_table_columns:
+                grouped.setdefault(col.get("customTableDefinitionId"), []).append(col)
+            self._custom_table_columns_by_table = grouped
+        # A copy: the grouped lists are the cache's own, and a caller that
+        # sorted or appended to one would reorder every later read.
+        return list(self._custom_table_columns_by_table.get(table_id, ()))
 
     def get_peril(self, identifier: int | str) -> Peril | None:
         """
@@ -546,10 +735,32 @@ class ReferenceDataCache:
         """Get event set by ID or name (case-insensitive)."""
         return self._lookup(identifier, self._event_sets, EventSet)
 
+    def get_role(self, identifier: str | None) -> Role | None:
+        """Get an Identity role by its GUID or name (case-insensitive)."""
+        return self._lookup(identifier, self._roles, Role)
+
+    def get_user(self, identifier: str | None) -> User | None:
+        """Get an Identity user by GUID, email, or "First Last" name.
+
+        The lookup is case-insensitive. Returns None when the identifier is
+        None, so a caller can pass an unassigned ``userId`` straight through.
+        """
+        return self._lookup(identifier, self._users, User)
+
+    def active_program_roles(self) -> list[Role]:
+        """Every role a deal can assign, in the platform's display order.
+
+        A deal's Roles panel lists these whether or not anyone holds them, so
+        Program.roles walks this list rather than the deal's own rows.
+        """
+        return self._active_in_display_order(
+            "roles", lambda role: role.program_role_flag
+        )
+
     @staticmethod
     def _lookup_ref(
-        identifier: int | str,
-        by_id: dict[int, dict[str, Any]],
+        identifier: int | str | None,
+        by_id: dict[Any, dict[str, Any]],
         by_name: dict[str, dict[str, Any]],
         model_cls: Callable[[dict[str, Any]], Any],
     ) -> Any | None:
@@ -559,7 +770,11 @@ class ReferenceDataCache:
         if isinstance(identifier, int):
             data = by_id.get(identifier)
         elif isinstance(identifier, str):
-            data = by_name.get(identifier.lower())
+            # A string can be an ID as well as a name: Identity keys roles and
+            # users by GUID. _index_values folds string keys, so the ID index is
+            # tried first, and a GUID cannot collide with a name.
+            folded = identifier.lower()
+            data = by_id.get(folded) or by_name.get(folded)
         else:
             return None
         return model_cls(data) if data else None

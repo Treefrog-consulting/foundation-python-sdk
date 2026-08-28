@@ -132,6 +132,7 @@ class ReferenceRun:
         as_of_date: datetime | None = None,
         claim_amount: str | None = None,
         historical_flag: bool | None = None,
+        distribute_claims: bool | None = None,
         event_list: list[int] | None = None,
         claims_history_values: dict[str, Any] | None = None,
     ) -> "RunConfiguration":
@@ -154,8 +155,11 @@ class ReferenceRun:
             as_of_date: Optional as-of date for analysis.
             claim_amount: Optional claim amount setting.
             historical_flag: Optional flag to include historical events.
+            distribute_claims: Optional flag to compute secondary uncertainty on claims (Blended/Claims-only analyses).
             event_list: Optional list of specific events to include.
-            claims_history_values: Optional claims history configuration.
+            claims_history_values: Optional claims history configuration. When
+                distribute_claims is set, each claims row's "Base CoV" entry here
+                drives the secondary uncertainty.
 
         Returns:
             RunConfiguration instance ready for loss analysis.
@@ -191,6 +195,7 @@ class ReferenceRun:
             as_of_date=as_of_date,
             claim_amount=claim_amount,
             historical_flag=historical_flag,
+            distribute_claims=distribute_claims,
             event_list=event_list,
             claims_history_values=claims_history_values,
             label=self.name,

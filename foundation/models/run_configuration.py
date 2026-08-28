@@ -72,6 +72,7 @@ class RunConfiguration:
         as_of_date: datetime | None = None,
         claim_amount: str | None = None,
         historical_flag: bool | None = None,
+        distribute_claims: bool | None = None,
         event_list: list[int] | None = None,
         claims_history_values: dict[str, Any] | None = None,
         label: str | None = None,
@@ -93,8 +94,11 @@ class RunConfiguration:
             as_of_date: Optional as-of date for analysis.
             claim_amount: Optional claim amount setting.
             historical_flag: Optional flag to include historical events.
+            distribute_claims: Optional flag to compute secondary uncertainty on claims (Blended/Claims-only analyses).
             event_list: Optional list of specific events to include.
-            claims_history_values: Optional claims history configuration.
+            claims_history_values: Optional claims history configuration. When
+                distribute_claims is set, each claims row's "Base CoV" entry here
+                drives the secondary uncertainty.
             label: Optional label for this configuration (e.g., "Default", "LabelB").
         """
         self.sim_years = sim_years
@@ -111,6 +115,7 @@ class RunConfiguration:
         self.as_of_date = as_of_date
         self.claim_amount = claim_amount
         self.historical_flag = historical_flag
+        self.distribute_claims = distribute_claims
         self.event_list = event_list
         self.claims_history_values = claims_history_values
         self.label = label
@@ -142,6 +147,7 @@ class RunConfiguration:
             analysis_type=data.get("analysisType"),
             event_split_view_id=data.get("eventSplitViewId"),
             apply_loss_splits_flag=data.get("applyLossSplitsFlag"),
+            distribute_claims=data.get("distributeClaims"),
             label=data.get("label"),
         )
 
@@ -164,6 +170,7 @@ class RunConfiguration:
             "asOfDate": self.as_of_date.isoformat() if self.as_of_date else None,
             "claimAmount": self.claim_amount,
             "historicalFlag": self.historical_flag,
+            "distributeClaims": self.distribute_claims,
             "eventList": self.event_list,
             "claimsHistoryValues": self.claims_history_values,
             "eventSplitViewId": self.event_split_view_id,
@@ -211,6 +218,7 @@ class RunConfiguration:
                 "as_of_date",
                 "claim_amount",
                 "historical_flag",
+                "distribute_claims",
                 "event_list",
                 "claims_history_values",
                 "label",
@@ -254,6 +262,8 @@ class RunConfiguration:
             print(f"  {'claim_amount':<25} {self.claim_amount}")
         if self.historical_flag is not None:
             print(f"  {'historical_flag':<25} {self.historical_flag}")
+        if self.distribute_claims is not None:
+            print(f"  {'distribute_claims':<25} {self.distribute_claims}")
         if self.event_list is not None:
             print(f"  {'event_list':<25} {self.event_list}")
         if self.claims_history_values is not None:

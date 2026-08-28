@@ -11,9 +11,10 @@ Each entry is ``property_name -> (source, payload_key, model_class)``:
   ``id`` and ``name``; the full row is still reachable through ``as_polars()``.
 
 Sources:
-    Deal    Deal/Foundation.Deal/Models/ViewModels/Ref/RefViewModel.cs
-    Common  Common/Foundation.Common.Data/Models/ViewModels/RefViewModel.cs
-    Loss    Loss/Foundation.Loss.ViewModels/ReferenceViewModel.cs
+    Deal      Deal/Foundation.Deal/Models/ViewModels/Ref/RefViewModel.cs
+    Common    Common/Foundation.Common.Data/Models/ViewModels/RefViewModel.cs
+    Loss      Loss/Foundation.Loss.ViewModels/ReferenceViewModel.cs
+    Identity  Identity/Foundation.Identity/Controllers/Api/{Roles,Users}Controller.cs
 """
 
 from .base import BaseModel
@@ -31,13 +32,16 @@ from .layer_limit_attach_type import LayerLimitAttachType
 from .layer_order_term_type import LayerOrderTermType
 from .layer_premium_type import LayerPremiumType
 from .layer_status import LayerStatus
+from .lob import Lob
 from .participant import Participant
 from .participant_status import ParticipantStatus
 from .peril import Peril
 from .perspective import Perspective
 from .region import Region
 from .reinst_prem_base import ReinstPremBase
+from .role import Role
 from .unit_of_measure import UnitOfMeasure
+from .user import User
 from .variant import Variant
 from .vendor import Vendor
 
@@ -45,6 +49,7 @@ DEAL = "deal"
 COMMON = "common"
 LOSS = "loss"
 CLIENTS = "clients"
+IDENTITY = "identity"
 
 REFERENCE_TABLES: dict[str, tuple[str, str, type[BaseModel] | None]] = {
     # Deal module - /api/ref
@@ -96,6 +101,7 @@ REFERENCE_TABLES: dict[str, tuple[str, str, type[BaseModel] | None]] = {
     # Common module - /api/ref
     "perils": (COMMON, "peril", Peril),
     "regions": (COMMON, "region", Region),
+    "lobs": (COMMON, "lob", Lob),
     # Catastrophe models, not the foundation.models package.
     "models": (COMMON, "model", None),
     "model_views": (COMMON, "modelView", None),
@@ -111,4 +117,8 @@ REFERENCE_TABLES: dict[str, tuple[str, str, type[BaseModel] | None]] = {
     "vendors": (LOSS, "vendor", Vendor),
     "upload_statuses": (LOSS, "uploadStatus", None),
     "event_split_views": (LOSS, "eventSplitView", None),
+    # Identity module - /api/Roles and /api/Users. Each arrives as a bare list
+    # rather than a /api/ref envelope, so the cache wraps it in one.
+    "roles": (IDENTITY, "roles", Role),
+    "users": (IDENTITY, "users", User),
 }

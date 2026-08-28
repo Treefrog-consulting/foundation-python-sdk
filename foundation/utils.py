@@ -103,6 +103,39 @@ def camel_to_snake(name: str) -> str:
     return name.lower()
 
 
+def claim_unique_name(snake: str, claimed: set[str]) -> str:
+    """
+    Claim a free numeric-suffixed variant of a snake_case name.
+
+    The suffix has to be searched, not counted: a name that already ends in
+    "_2" occupies the slot the second occurrence of its unsuffixed form would
+    be given, and handing the same name out twice loses one of the two.
+
+    Args:
+        snake: The snake_case name to claim
+        claimed: Names handed out so far, updated in place
+
+    Returns:
+        A name not present in `claimed`
+
+    Examples:
+        >>> claimed = set()
+        >>> claim_unique_name("coverage_type_2", claimed)
+        'coverage_type_2'
+        >>> claim_unique_name("coverage_type", claimed)
+        'coverage_type'
+        >>> claim_unique_name("coverage_type", claimed)
+        'coverage_type_3'
+    """
+    resolved, suffix = snake, 1
+    while resolved in claimed:
+        suffix += 1
+        resolved = f"{snake}_{suffix}"
+
+    claimed.add(resolved)
+    return resolved
+
+
 def resolve_snake_case_collisions(names: list[str]) -> dict[str, str]:
     """
     Resolve snake_case collisions by appending numeric suffixes.
@@ -121,26 +154,14 @@ def resolve_snake_case_collisions(names: list[str]) -> dict[str, str]:
         {'PC': 'pc', 'PC_': 'pc_2', 'Portfolio Tag': 'portfolio_tag'}
         >>> resolve_snake_case_collisions(['Test', 'test', 'TEST'])
         {'Test': 'test', 'test': 'test_2', 'TEST': 'test_3'}
+        >>> resolve_snake_case_collisions(['Coverage Type 2', 'Coverage type'])
+        {'Coverage Type 2': 'coverage_type_2', 'Coverage type': 'coverage_type'}
     """
-    mapping = {}
-    snake_counts = {}
-
-    for original_name in names:
-        snake_name = camel_to_snake(original_name)
-
-        # Track how many times we've seen this snake_case name
-        if snake_name not in snake_counts:
-            snake_counts[snake_name] = 0
-
-        snake_counts[snake_name] += 1
-
-        # First occurrence gets the plain name, subsequent get _2, _3, etc.
-        if snake_counts[snake_name] == 1:
-            mapping[original_name] = snake_name
-        else:
-            mapping[original_name] = f"{snake_name}_{snake_counts[snake_name]}"
-
-    return mapping
+    claimed: set[str] = set()
+    return {
+        original_name: claim_unique_name(camel_to_snake(original_name), claimed)
+        for original_name in names
+    }
 
 
 def snake_to_camel(name: str) -> str:

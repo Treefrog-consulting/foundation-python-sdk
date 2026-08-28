@@ -13,6 +13,7 @@ from .layer import Layer
 from .program_broker import ProgramBroker
 from .program_categories import ProgramCategories
 from .program_external_refs import ProgramExternalRefs
+from .program_role import ProgramRole
 from .program_versions import ProgramVersions
 from .run_configurations import RunConfigurations
 
@@ -76,6 +77,10 @@ class Program(CustomDataMixin):
             program_data.get("programCategories", []), ref_cache
         )
 
+        # Process roles. Every active program role gets a row whether or not
+        # this deal fills it, matching the UI's Roles table.
+        self._roles = self._build_roles(program_data.get("programRoles") or [])
+
         # Process external references
         self._external_refs = ProgramExternalRefs(
             program_data.get("programExternalRefs", []), ref_cache
@@ -83,6 +88,47 @@ class Program(CustomDataMixin):
 
         # Build the info lists for every program-level custom field and table
         self._init_custom_metadata(ref_cache, raw_table_rows)
+
+    def _build_roles(self, raw_roles: list[dict[str, Any]]) -> list[ProgramRole]:
+        """Pair every active program role with the deal's row for it, if any.
+
+        The platform stores at most one row per (deal, role) and leaves userId
+        null on an unfilled one, so the first row for a role fills its slot. No
+        row is dropped, though: a second row for the same role, or one naming a
+        role the reference data does not know, follows the slots rather than
+        disappearing -- losing either would hide an assignment entirely, and
+        nothing in the schema enforces the one-row rule.
+        """
+        rows_by_role_id: dict[str, list[dict[str, Any]]] = {}
+        extras: list[dict[str, Any]] = []
+        for row in raw_roles:
+            role_id = row.get("roleId")
+            if role_id is None:
+                # No role to slot it against, but it is still an assignment.
+                extras.append(row)
+            else:
+                rows_by_role_id.setdefault(str(role_id).lower(), []).append(row)
+
+        roles = []
+        for role in self._ref_cache.active_program_roles():
+            rows = rows_by_role_id.pop((role.id or "").lower(), [])
+            roles.append(ProgramRole(rows[0] if rows else {}, self._ref_cache, role))
+            extras.extend(rows[1:])
+
+        for rows in rows_by_role_id.values():
+            extras.extend(rows)
+        roles.extend(ProgramRole(row, self._ref_cache) for row in extras)
+        return roles
+
+    def _document_rows(self, name: str, camel_name: str) -> list[dict[str, Any]]:
+        """The document's rows for a collection, with any edit applied."""
+        if name in self._modifications:
+            return self._modifications[name] or []
+        return self._data.get(camel_name) or []
+
+    def _edited(self, name: str) -> bool:
+        """Whether set_document_field has replaced this collection's rows."""
+        return name in self._modifications
 
     def _require_writable(self, action: str) -> None:
         """Reject a modification when this program is a past version.
@@ -148,7 +194,7 @@ class Program(CustomDataMixin):
 
         Example:
             >>> previous = program.get_version(23011)
-            >>> print(previous.layers[0].collateral_req_share)
+            >>> print(previous.layers[0].get_document_field("collateral_req_share"))
         """
         if self._foundation_client is None:
             raise RuntimeError(
@@ -156,6 +202,33 @@ class Program(CustomDataMixin):
                 "Use client.get_program() to retrieve the program."
             )
         return self._foundation_client.get_program(self.id, version_id=version_id)
+
+    def get_previous(self) -> Optional["Program"]:
+        """
+        The deal this one was renewed from, or None if it is not a renewal.
+
+        The deal document carries only the previous deal's ID, so this issues a
+        fresh read for it -- and therefore an access check, which can raise
+        PermissionDeniedError or NotFoundError for a deal this user cannot see.
+
+        Returns:
+            The previous Program, or None when renewed_from_id is unset.
+
+        Example:
+            >>> previous = program.get_previous()
+            >>> if previous:
+            ...     print(previous.name, previous.uw_year)
+        """
+        previous_id = self.renewed_from_id
+        if previous_id is None:
+            return None
+        if self._foundation_client is None:
+            raise RuntimeError(
+                "Program must be associated with a client to read the deal it "
+                "was renewed from. Use client.get_program() to retrieve the "
+                "program."
+            )
+        return self._foundation_client.get_program(previous_id)
 
     # Standard program properties with full type hints
     @property
@@ -247,11 +320,78 @@ class Program(CustomDataMixin):
         """Set years on account."""
         self._modifications["years_on_account"] = value
 
+    @property
+    def renewed_from_id(self) -> int | None:
+        """ID of the deal this one was renewed from ("Renewed From" in the UI).
+
+        None when the deal is not a renewal of another. Use get_previous() to
+        read that deal.
+        """
+        if "renewed_from_id" in self._modifications:
+            return self._modifications["renewed_from_id"]
+        return self._data.get("renewedFromId")
+
+    @renewed_from_id.setter
+    def renewed_from_id(self, value: int | None) -> None:
+        """Set the deal this one was renewed from."""
+        self._modifications["renewed_from_id"] = value
+
+    @property
+    def client_id(self) -> int | None:
+        """ID of the deal's client. See the client property for the full record."""
+        if "client_id" in self._modifications:
+            return self._modifications["client_id"]
+        return self._data.get("clientId")
+
+    @client_id.setter
+    def client_id(self, value: int | None) -> None:
+        """Set the deal's client."""
+        self._modifications["client_id"] = value
+
+    @property
+    def program_group_id(self) -> int | None:
+        """ID of the deal group this deal belongs to ("Program Group" in the UI).
+
+        See client.program_groups for the group names.
+        """
+        if "program_group_id" in self._modifications:
+            return self._modifications["program_group_id"]
+        return self._data.get("programGroupId")
+
+    @program_group_id.setter
+    def program_group_id(self, value: int | None) -> None:
+        """Set the deal group."""
+        self._modifications["program_group_id"] = value
+
+    @property
+    def pricing_portfolio_id(self) -> int | None:
+        """ID of the reference portfolio this deal is priced against."""
+        if "pricing_portfolio_id" in self._modifications:
+            return self._modifications["pricing_portfolio_id"]
+        return self._data.get("pricingPortfolioId")
+
+    @pricing_portfolio_id.setter
+    def pricing_portfolio_id(self, value: int | None) -> None:
+        """Set the reference portfolio."""
+        self._modifications["pricing_portfolio_id"] = value
+
+    @property
+    def pricing_portfolio_src(self) -> int | None:
+        """How the reference portfolio is linked: 1 static, 2 sourced."""
+        if "pricing_portfolio_src" in self._modifications:
+            return self._modifications["pricing_portfolio_src"]
+        return self._data.get("pricingPortfolioSrc")
+
+    @pricing_portfolio_src.setter
+    def pricing_portfolio_src(self, value: int | None) -> None:
+        """Set how the reference portfolio is linked."""
+        self._modifications["pricing_portfolio_src"] = value
+
     # Reference data properties (read-only, enriched)
     @property
     def client(self) -> Optional["Client"]:
         """Client information (read-only, enriched from reference data)."""
-        client_id = self._data.get("clientId")
+        client_id = self.client_id
         if client_id:
             return self._ref_cache.get_client(client_id)
         return None
@@ -259,6 +399,11 @@ class Program(CustomDataMixin):
     @property
     def brokers(self) -> "NamedCollection[ProgramBroker]":
         """List of program brokers (read-only)."""
+        if self._edited("program_brokers"):
+            return NamedCollection(
+                ProgramBroker(broker, self._ref_cache)
+                for broker in self._document_rows("program_brokers", "programBrokers")
+            )
         return NamedCollection(self._brokers)
 
     @property
@@ -266,6 +411,31 @@ class Program(CustomDataMixin):
         """List of program layers (read-only). Supports indexing by number or name."""
         collection: NamedCollection[Layer] = NamedCollection(self._layers)
         return collection
+
+    @property
+    def roles(self) -> "NamedCollection[ProgramRole]":
+        """
+        Who holds each role on this deal (read-only).
+
+        Carries a row for every active program role, so a role nobody holds is
+        present with user None -- the same list the UI's Roles table shows.
+
+        Example:
+            >>> for role in program.roles:
+            ...     print(role)
+            Underwriter: Ada Lovelace
+            Actuary: (unassigned)
+
+            >>> program.roles["Underwriter"].user.email
+            'ada@example.com'
+
+            >>> program.roles.as_pandas()
+        """
+        if self._edited("program_roles"):
+            return NamedCollection(
+                self._build_roles(self._document_rows("program_roles", "programRoles"))
+            )
+        return NamedCollection(self._roles)
 
     @property
     def categories(self) -> ProgramCategories:
@@ -278,6 +448,11 @@ class Program(CustomDataMixin):
             >>> program.categories.modelling_status
             'Valuation'
         """
+        if self._edited("program_categories"):
+            return ProgramCategories(
+                self._document_rows("program_categories", "programCategories"),
+                self._ref_cache,
+            )
         return self._categories
 
     @property
@@ -321,6 +496,11 @@ class Program(CustomDataMixin):
             >>> # Get specific external ref by type name (alternative)
             >>> crm_id = program.external_refs.get_by_type("CRM Pro")
         """
+        if self._edited("program_external_refs"):
+            return ProgramExternalRefs(
+                self._document_rows("program_external_refs", "programExternalRefs"),
+                self._ref_cache,
+            )
         return self._external_refs
 
     def create_loss_group(self, name: str) -> "LossGroup":
@@ -359,8 +539,11 @@ class Program(CustomDataMixin):
                 # Update the custom field in programCustomFields array
                 self._update_custom_field_in_json(result, key, value)
             else:
-                # Regular field - convert to camelCase and serialize dates
-                camel_key = snake_to_camel(key)
+                # Regular field - resolve the document key and serialize dates.
+                # _document_key, not a bare fold: a key whose name ends in an
+                # acronym (dcfID) folds to something else (dcfId), and writing
+                # that would add a second key the server ignores.
+                camel_key = self._document_key(key) or snake_to_camel(key)
                 # Convert date/datetime objects to ISO strings for JSON serialization
                 if isinstance(value, datetime):
                     result[camel_key] = to_wire_datetime(value)
@@ -415,6 +598,7 @@ class Program(CustomDataMixin):
         print("\nCOLLECTIONS:")
         print(f"  brokers                        {len(self.brokers)} item(s)")
         print(f"  layers                         {len(self.layers)} item(s)")
+        print(f"  roles                          {len(self.roles)} item(s)")
 
         print("\nAVAILABLE METHODS:")
         for method in (
@@ -422,6 +606,9 @@ class Program(CustomDataMixin):
             "set_custom_field(field_name, value)",
             "get_custom_table(table_name)",
             "set_custom_table(table_name, rows)",
+            "get_document_field(name)",
+            "set_document_field(name, value)",
+            "get_previous()",
             "get_json()",
             "describe()",
         ):
@@ -446,6 +633,11 @@ class Program(CustomDataMixin):
             ("renewal_flag", "read-write", self.renewal_flag),
             ("note", "read-write", self.note),
             ("years_on_account", "read-write", self.years_on_account),
+            ("renewed_from_id", "read-write", self.renewed_from_id),
+            ("client_id", "read-write", self.client_id),
+            ("program_group_id", "read-write", self.program_group_id),
+            ("pricing_portfolio_id", "read-write", self.pricing_portfolio_id),
+            ("pricing_portfolio_src", "read-write", self.pricing_portfolio_src),
         ):
             value_str = str(value)[:28] if value is not None else "None"
             print(f"  {prop_name:<30} {access:<10} {value_str:<30}")

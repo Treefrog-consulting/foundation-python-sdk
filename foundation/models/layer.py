@@ -224,7 +224,7 @@ class Layer(CustomDataMixin):
 
         Example:
             >>> previous = layer.get_version(23011)
-            >>> print(previous.collateral_req_share)
+            >>> print(previous.get_document_field("collateral_req_share"))
             >>> df = previous.layered_losses.as_polars(config)
         """
         if self._program is None:
@@ -349,11 +349,93 @@ class Layer(CustomDataMixin):
         """Set unlimited reinstatement flag."""
         self._modifications["unlimited_reinst_flag"] = value
 
-    # Reference data properties (read-only, enriched)
+    @property
+    def rol_type(self) -> int | None:
+        """Basis the rate on line is quoted on: 1 occurrence, 2 aggregate."""
+        if "rol_type" in self._modifications:
+            return self._modifications["rol_type"]
+        return self._data.get("rolType")
+
+    @rol_type.setter
+    def rol_type(self, value: int | None) -> None:
+        """Set the rate-on-line basis."""
+        self._modifications["rol_type"] = value
+
+    @property
+    def allocate_contrib_events_flag(self) -> bool | None:
+        """Whether loss is allocated across every contributing event.
+
+        When set, each event above the occurrence retention takes a
+        proportional share regardless of aggregate exhaustion -- so two layers
+        with the same limits and attachments can produce different layered
+        losses, and this is the flag that explains it.
+        """
+        if "allocate_contrib_events_flag" in self._modifications:
+            return self._modifications["allocate_contrib_events_flag"]
+        return self._data.get("allocateContribEventsFlag")
+
+    @allocate_contrib_events_flag.setter
+    def allocate_contrib_events_flag(self, value: bool | None) -> None:
+        """Set the contributing-event allocation flag."""
+        self._modifications["allocate_contrib_events_flag"] = value
+
+    # The reference keys the layer row carries. Each has an enriched read-only
+    # counterpart below; these are the settable form, and what a scenario edits.
+    @property
+    def currency_id(self) -> int | None:
+        """ID of the layer's currency. See the currency property for the record."""
+        if "currency_id" in self._modifications:
+            return self._modifications["currency_id"]
+        return self._data.get("currencyId")
+
+    @currency_id.setter
+    def currency_id(self, value: int | None) -> None:
+        """Set the layer's currency."""
+        self._modifications["currency_id"] = value
+
+    @property
+    def unit_of_measure_id(self) -> int | None:
+        """ID of the layer's unit of measure."""
+        if "unit_of_measure_id" in self._modifications:
+            return self._modifications["unit_of_measure_id"]
+        return self._data.get("unitOfMeasureId")
+
+    @unit_of_measure_id.setter
+    def unit_of_measure_id(self, value: int | None) -> None:
+        """Set the layer's unit of measure."""
+        self._modifications["unit_of_measure_id"] = value
+
+    @property
+    def layer_status_id(self) -> int | None:
+        """ID of the layer's status."""
+        if "layer_status_id" in self._modifications:
+            return self._modifications["layer_status_id"]
+        return self._data.get("layerStatusId")
+
+    @layer_status_id.setter
+    def layer_status_id(self, value: int | None) -> None:
+        """Set the layer's status."""
+        self._modifications["layer_status_id"] = value
+
+    @property
+    def reinst_prem_base_id(self) -> int | None:
+        """ID of the layer's reinstatement premium base."""
+        if "reinst_prem_base_id" in self._modifications:
+            return self._modifications["reinst_prem_base_id"]
+        return self._data.get("reinstPremBaseId")
+
+    @reinst_prem_base_id.setter
+    def reinst_prem_base_id(self, value: int | None) -> None:
+        """Set the layer's reinstatement premium base."""
+        self._modifications["reinst_prem_base_id"] = value
+
+    # Reference data properties (read-only, enriched). Each reads its key
+    # through the scalar property above, so an edited id resolves to the row
+    # the export will actually use rather than the one the deal was read with.
     @property
     def status(self) -> Optional["LayerStatus"]:
         """Layer status (read-only, enriched from reference data)."""
-        status_id = self._data.get("layerStatusId")
+        status_id = self.layer_status_id
         if status_id:
             return self._ref_cache.get_layer_status(status_id)
         return None
@@ -361,7 +443,7 @@ class Layer(CustomDataMixin):
     @property
     def currency(self) -> Optional["Currency"]:
         """Currency (read-only, enriched from reference data)."""
-        currency_id = self._data.get("currencyId")
+        currency_id = self.currency_id
         if currency_id:
             return self._ref_cache.get_currency(currency_id)
         return None
@@ -369,7 +451,7 @@ class Layer(CustomDataMixin):
     @property
     def unit_of_measure(self) -> Optional["UnitOfMeasure"]:
         """Unit of measure (read-only, enriched from reference data)."""
-        unit_id = self._data.get("unitOfMeasureId")
+        unit_id = self.unit_of_measure_id
         if unit_id:
             return self._ref_cache.get_unit_of_measure(unit_id)
         return None
@@ -377,25 +459,39 @@ class Layer(CustomDataMixin):
     @property
     def reinst_prem_base(self) -> Optional["ReinstPremBase"]:
         """Reinstatement premium base (read-only, enriched from reference data)."""
-        reinst_prem_base_id = self._data.get("reinstPremBaseId")
+        reinst_prem_base_id = self.reinst_prem_base_id
         if reinst_prem_base_id:
             return self._ref_cache.get_reinst_prem_base(reinst_prem_base_id)
         return None
 
     @property
     def participants(self) -> "NamedCollection[LayerParticipant]":
-        """List of layer participants (read-only)."""
+        """List of layer participants (read-only).
+
+        Reads through set_document_field("layer_participants") when one has been
+        made, so a scenario reports the participants its export will use rather
+        than the ones the layer was read with.
+        """
         return NamedCollection(
             LayerParticipant(p, self._ref_cache)
-            for p in self._data.get("layerParticipants", [])
+            for p in self._document_rows("layer_participants", "layerParticipants")
         )
 
     @property
     def reinstatements(self) -> "NamedCollection[Reinstatement]":
-        """List of layer reinstatements (read-only)."""
+        """List of layer reinstatements (read-only).
+
+        Reads through set_document_field("layer_reinst") when one has been made.
+        """
         return NamedCollection(
-            Reinstatement(r) for r in self._data.get("layerReinst", [])
+            Reinstatement(r) for r in self._document_rows("layer_reinst", "layerReinst")
         )
+
+    def _document_rows(self, name: str, camel_name: str) -> list[dict[str, Any]]:
+        """The document's rows for a collection, with any edit applied."""
+        if name in self._modifications:
+            return self._modifications[name] or []
+        return self._data.get(camel_name) or []
 
     @property
     def program(self) -> Optional["Program"]:
@@ -474,8 +570,11 @@ class Layer(CustomDataMixin):
             elif key in self._premiums:
                 self._update_premium_in_json(result, key, value)
             else:
-                # Regular field - convert to camelCase and serialize dates
-                camel_key = snake_to_camel(key)
+                # Regular field - resolve the document key and serialize dates.
+                # _document_key, not a bare fold: a key whose name ends in an
+                # acronym (dcfID) folds to something else (dcfId), and writing
+                # that would add a second key the server ignores.
+                camel_key = self._document_key(key) or snake_to_camel(key)
                 # Convert date/datetime objects to ISO strings for JSON serialization
                 if isinstance(value, datetime):
                     result[camel_key] = to_wire_datetime(value)
@@ -729,6 +828,16 @@ class Layer(CustomDataMixin):
             ("limit_percent", "read-write", self.limit_percent),
             ("structure_only_flag", "read-write", self.structure_only_flag),
             ("unlimited_reinst_flag", "read-write", self.unlimited_reinst_flag),
+            ("rol_type", "read-write", self.rol_type),
+            (
+                "allocate_contrib_events_flag",
+                "read-write",
+                self.allocate_contrib_events_flag,
+            ),
+            ("currency_id", "read-write", self.currency_id),
+            ("unit_of_measure_id", "read-write", self.unit_of_measure_id),
+            ("layer_status_id", "read-write", self.layer_status_id),
+            ("reinst_prem_base_id", "read-write", self.reinst_prem_base_id),
         ]
 
         for prop_name, access, value in standard_props:
@@ -802,6 +911,8 @@ class Layer(CustomDataMixin):
             "set_custom_field(field_name, value)",
             "get_custom_table(table_name)",
             "set_custom_table(table_name, rows)",
+            "get_document_field(name)",
+            "set_document_field(name, value)",
             "get_json()",
             "describe()",
         ]

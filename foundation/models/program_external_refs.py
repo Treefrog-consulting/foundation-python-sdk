@@ -3,7 +3,7 @@
 from typing import TYPE_CHECKING, Any
 
 from ..utils import camel_to_snake
-from ._init_helpers import raise_if_private
+from ._init_helpers import raise_if_private, raise_read_only
 
 if TYPE_CHECKING:
     from ..ref_data import ReferenceDataCache
@@ -152,6 +152,10 @@ class ProgramExternalRefs:
         raise AttributeError(
             f"'{self.__class__.__name__}' object has no attribute '{name}'"
         )
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        """Refuse a write; external references are read-only through the SDK."""
+        raise_read_only(self, name, value, "external references")
 
     def __dir__(self) -> list[str]:
         """

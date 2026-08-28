@@ -86,7 +86,11 @@ class ReferenceTable(list):
             row_id = raw.get("id")
             if row_id is not None:
                 self.by_id[row_id] = item
-            name = raw.get("name")
+            # The model's name, not the raw key: a user record carries no
+            # "name" field at all and assembles one from its first and last.
+            name = getattr(item, "name", None)
+            if name is None:
+                name = raw.get("name")
             if name is not None:
                 self.by_name[name] = item
             code = raw.get("code")

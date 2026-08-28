@@ -19,6 +19,7 @@ from .layer_participant import LayerParticipant
 from .layer_premium_type import LayerPremiumType
 from .layer_status import LayerStatus
 from .layered_losses import LayeredLosses
+from .lob import Lob
 from .loss_group import LossGroup
 from .loss_set_result import LossGroupUploadResult, LossSetResult
 from .metric_results import MetricResults
@@ -30,6 +31,7 @@ from .perspective import Perspective
 from .program import Program
 from .program_broker import ProgramBroker
 from .program_external_refs import ExternalRef, ProgramExternalRefs
+from .program_role import ProgramRole
 from .program_version import ProgramVersion
 from .program_versions import ProgramVersions
 from .reference_run import ReferenceRun
@@ -38,9 +40,11 @@ from .reference_table import ReferenceTable
 from .region import Region
 from .reinst_prem_base import ReinstPremBase
 from .reinstatement import Reinstatement
+from .role import Role
 from .run_configuration import RunConfiguration
 from .run_configurations import RunConfigurations
 from .unit_of_measure import UnitOfMeasure
+from .user import User
 from .variant import Variant
 from .vendor import Vendor
 from .ylt import Ylt
@@ -65,6 +69,7 @@ __all__ = [
     "LayerPremiumType",
     "LayerStatus",
     "LayeredLosses",
+    "Lob",
     "LossGroup",
     "LossGroupUploadResult",
     "LossSetResult",
@@ -78,6 +83,7 @@ __all__ = [
     "Program",
     "ProgramBroker",
     "ProgramExternalRefs",
+    "ProgramRole",
     "ProgramVersion",
     "ProgramVersions",
     "ReferenceRun",
@@ -86,9 +92,11 @@ __all__ = [
     "Region",
     "ReinstPremBase",
     "Reinstatement",
+    "Role",
     "RunConfiguration",
     "RunConfigurations",
     "UnitOfMeasure",
+    "User",
     "Variant",
     "Vendor",
     "Ylt",
