@@ -201,29 +201,6 @@ class ReferenceRun:
             label=self.name,
         )
 
-    def __dir__(self):
-        """Return list of available attributes for autocomplete."""
-        attrs = set(super().__dir__())
-        attrs.update(
-            [
-                "id",
-                "name",
-                "description",
-                "vendor_id",
-                "variant_id",
-                "perspective_id",
-                "sim_years",
-                "event_set_id",
-                "model_view_id",
-                "preference_group",
-                "preference_order",
-                "active_flag",
-                "to_run_configuration",
-                "describe",
-            ]
-        )
-        return sorted(attrs)
-
     def describe(self) -> None:
         """Display a comprehensive overview of this reference run.
 

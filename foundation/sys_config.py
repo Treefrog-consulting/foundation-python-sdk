@@ -11,27 +11,27 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Iterable
-from typing import Literal
 
-LossType = Literal["yelt", "elt"]
+from .enums import LossType
 
-_YELT_KEYS_IN_ORDER: list[str] = [
-    "YELTColAliasYear",
-    "YELTColAliasEvent",
-    "YELTColAliasRegion",
-    "YELTColAliasSequence",
-    "YELTColAliasLoss",
-    "YELTColAliasPeril",
-]
-
-_ELT_KEYS_IN_ORDER: list[str] = [
-    "ELTColAliasListLoss",
-    "ELTColAliasListEvent",
-    "ELTColAliasListStdDevI",
-    "ELTColAliasListStdDevc",
-    "ELTColAliasListExposure",
-    "ELTColAliasListRate",
-]
+_KEYS_IN_ORDER: dict[LossType, list[str]] = {
+    LossType.YELT: [
+        "YELTColAliasYear",
+        "YELTColAliasEvent",
+        "YELTColAliasRegion",
+        "YELTColAliasSequence",
+        "YELTColAliasLoss",
+        "YELTColAliasPeril",
+    ],
+    LossType.ELT: [
+        "ELTColAliasListLoss",
+        "ELTColAliasListEvent",
+        "ELTColAliasListStdDevI",
+        "ELTColAliasListStdDevc",
+        "ELTColAliasListExposure",
+        "ELTColAliasListRate",
+    ],
+}
 
 
 def _parse_aliases(raw: str) -> list[str]:
@@ -45,56 +45,43 @@ class SysConfigCache:
             for e in raw_entries
             if e.get("name")
         }
-        self._yelt_aliases: list[list[str]] = [
-            _parse_aliases(by_key.get(k, "")) for k in _YELT_KEYS_IN_ORDER
-        ]
-        self._elt_aliases: list[list[str]] = [
-            _parse_aliases(by_key.get(k, "")) for k in _ELT_KEYS_IN_ORDER
-        ]
+        self._aliases: dict[LossType, list[list[str]]] = {
+            loss_type: [_parse_aliases(by_key.get(k, "")) for k in keys]
+            for loss_type, keys in _KEYS_IN_ORDER.items()
+        }
 
-        missing_yelt = [
-            k
-            for k, v in zip(_YELT_KEYS_IN_ORDER, self._yelt_aliases, strict=True)
-            if not v
-        ]
-        missing_elt = [
-            k
-            for k, v in zip(_ELT_KEYS_IN_ORDER, self._elt_aliases, strict=True)
-            if not v
-        ]
-        if missing_yelt:
-            warnings.warn(
-                f"SysConfig missing YELT alias keys: {missing_yelt}; "
-                "add_yelt() will raise until these are configured.",
-                stacklevel=2,
-            )
-        if missing_elt:
-            warnings.warn(
-                f"SysConfig missing ELT alias keys: {missing_elt}; "
-                "add_elt() will raise until these are configured.",
-                stacklevel=2,
-            )
+        for loss_type in _KEYS_IN_ORDER:
+            if missing := self.missing_keys(loss_type):
+                warnings.warn(
+                    f"SysConfig missing {loss_type.upper()} alias keys: {missing}; "
+                    f"add_{loss_type}() will raise until these are configured.",
+                    stacklevel=2,
+                )
 
-    def is_loaded_for(self, loss_type: LossType) -> bool:
+    def is_loaded_for(self, loss_type: LossType | str) -> bool:
         return all(bool(aliases) for aliases in self._aliases_or_empty(loss_type))
 
     def yelt_columns(self) -> list[str]:
-        return [aliases[0] if aliases else "" for aliases in self._yelt_aliases]
+        return [
+            aliases[0] if aliases else "" for aliases in self._aliases[LossType.YELT]
+        ]
 
     def elt_columns(self) -> list[str]:
-        return [aliases[0] if aliases else "" for aliases in self._elt_aliases]
+        return [
+            aliases[0] if aliases else "" for aliases in self._aliases[LossType.ELT]
+        ]
 
-    def columns_for(self, loss_type: LossType) -> list[list[str]]:
+    def columns_for(self, loss_type: LossType | str) -> list[list[str]]:
         """Return aliases per canonical slot; the first alias is the output header."""
         return [list(aliases) for aliases in self._aliases_or_empty(loss_type)]
 
-    def missing_keys(self, loss_type: LossType) -> list[str]:
-        keys = _YELT_KEYS_IN_ORDER if loss_type == "yelt" else _ELT_KEYS_IN_ORDER
+    def missing_keys(self, loss_type: LossType | str) -> list[str]:
+        keys = _KEYS_IN_ORDER[LossType(loss_type)]
         values = self._aliases_or_empty(loss_type)
         return [k for k, v in zip(keys, values, strict=True) if not v]
 
     def missing_columns(
-        self, loss_type: LossType, user_columns: Iterable[str]
+        self, loss_type: LossType | str, user_columns: Iterable[str]
     ) -> list[str]:
         expected = self._aliases_or_empty(loss_type)
         user_fold = {c.casefold() for c in user_columns}
@@ -105,7 +92,7 @@ class SysConfigCache:
         ]
 
     def duplicate_columns(
-        self, loss_type: LossType, user_columns: Iterable[str]
+        self, loss_type: LossType | str, user_columns: Iterable[str]
     ) -> list[str]:
         """Return canonical-column names for which the user's DataFrame has two
         columns matching (case-insensitive) the same alias slot."""
@@ -123,9 +110,5 @@ class SysConfigCache:
                 out.append(f"{aliases[0]} (matched: {matches})")
         return out
 
-    def _aliases_or_empty(self, loss_type: LossType) -> list[list[str]]:
-        if loss_type == "yelt":
-            return self._yelt_aliases
-        if loss_type == "elt":
-            return self._elt_aliases
-        raise ValueError(f"unknown loss type: {loss_type}")
+    def _aliases_or_empty(self, loss_type: LossType | str) -> list[list[str]]:
+        return self._aliases[LossType(loss_type)]

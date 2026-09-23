@@ -17,6 +17,9 @@ from ..exceptions import ExportError, FoundationHTTPError
 from ..utils import require
 
 if TYPE_CHECKING:
+    import pandas as pd
+    import polars as pl
+
     from .layer import Layer
     from .program import Program
     from .run_configuration import RunConfiguration
@@ -97,12 +100,28 @@ class _LossExportAccessor:
     def __call__(self, run_config: "RunConfiguration") -> Any:
         return self.as_polars(run_config)
 
-    def as_polars(self, run_config: "RunConfiguration") -> Any:
+    def as_polars(self, run_config: "RunConfiguration") -> "pl.DataFrame":
+        """Get this accessor's data as a Polars DataFrame.
+
+        See the class docstring for the columns.
+
+        Raises:
+            ImportError: If polars is not installed.
+            RuntimeError: If the API call fails or data cannot be loaded.
+        """
         require("polars", "as_polars")
         require("pyarrow", "as_polars")
         return self._execute(run_config, "pl")
 
-    def as_pandas(self, run_config: "RunConfiguration") -> Any:
+    def as_pandas(self, run_config: "RunConfiguration") -> "pd.DataFrame":
+        """Get this accessor's data as a pandas DataFrame.
+
+        See the class docstring for the columns.
+
+        Raises:
+            ImportError: If pandas is not installed.
+            RuntimeError: If the API call fails or data cannot be loaded.
+        """
         require("pandas", "as_pandas")
         return self._execute(run_config, "df")
 

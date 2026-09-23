@@ -12,16 +12,6 @@ class Category(BaseModel):
         return self._data.get("code")
 
     @property
-    def sort_order(self) -> int | None:
-        """Sort order."""
-        return self._data.get("sortOrder")
-
-    @property
-    def active_flag(self) -> bool | None:
-        """Whether the category is active."""
-        return self._data.get("activeFlag")
-
-    @property
     def multi_select_flag(self) -> bool | None:
         """Whether a deal may assign this category more than one value.
 

@@ -9,11 +9,12 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 import requests
 
 from ..csv_builder import build_csv
+from ..enums import LossType
 from ..exceptions import LossGroupAttachError, LossSetValidationError
 from .loss_set_result import LossGroupUploadResult, LossSetResult
 
@@ -21,9 +22,8 @@ if TYPE_CHECKING:
     from .foundation_client import FoundationClient
 
 
-LossTypeStr = Literal["yelt", "elt"]
-_YELT_LOSS_TYPE_ID = 2
-_ELT_LOSS_TYPE_ID = 4
+# Foundation.Loss.Data.Enums.LossType IDs.
+_LOSS_TYPE_IDS = {LossType.YELT: 2, LossType.ELT: 4}
 
 
 # --- Upload-status constants mirroring Foundation.Loss.Data.Enums.UploadStatusEnum ---
@@ -35,7 +35,7 @@ _STATUS_ERROR = 4
 @dataclass
 class _QueuedLossSet:
     name: str
-    loss_type: LossTypeStr
+    loss_type: LossType
     csv_bytes: bytes
     currency_code: str
     event_set_id: int
@@ -84,7 +84,7 @@ class LossGroup:
         column_map: Mapping[str, str] | None = None,
     ) -> LossGroup:
         self._add(
-            "yelt",
+            LossType.YELT,
             name=name,
             data=data,
             currency_code=currency_code,
@@ -119,7 +119,7 @@ class LossGroup:
         column_map: Mapping[str, str] | None = None,
     ) -> LossGroup:
         self._add(
-            "elt",
+            LossType.ELT,
             name=name,
             data=data,
             currency_code=currency_code,
@@ -322,12 +322,9 @@ class LossGroup:
     def _build_loss_set_body(
         queued: _QueuedLossSet, loss_set_group_id: int
     ) -> dict[str, Any]:
-        loss_type_id = (
-            _YELT_LOSS_TYPE_ID if queued.loss_type == "yelt" else _ELT_LOSS_TYPE_ID
-        )
         return {
             "activeFlag": True,
-            "lossTypeId": loss_type_id,
+            "lossTypeId": _LOSS_TYPE_IDS[queued.loss_type],
             "description": queued.name,
             "simYears": queued.sim_years,
             "currencyCode": queued.currency_code,
@@ -347,7 +344,7 @@ class LossGroup:
 
     def _add(
         self,
-        loss_type: LossTypeStr,
+        loss_type: LossType,
         *,
         name: str,
         data: Any,

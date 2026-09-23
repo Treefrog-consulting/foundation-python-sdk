@@ -19,11 +19,6 @@ class Role(BaseModel):
         return str(value) if value is not None else None
 
     @property
-    def active_flag(self) -> bool | None:
-        """Whether the role is active."""
-        return self._data.get("activeFlag")
-
-    @property
     def program_role_flag(self) -> bool | None:
         """Whether the role is assignable on a deal.
 

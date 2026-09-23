@@ -25,13 +25,3 @@ class CustomTableDefinition(BaseModel):
     def page_id(self) -> int | None:
         """UI page the table is displayed on."""
         return self._data.get("pageId")
-
-    @property
-    def sort_order(self) -> int | None:
-        """Sort order."""
-        return self._data.get("sortOrder")
-
-    @property
-    def active_flag(self) -> bool | None:
-        """Whether the table is active."""
-        return self._data.get("activeFlag")

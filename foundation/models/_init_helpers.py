@@ -61,6 +61,32 @@ def raise_read_only(owner: Any, name: str, value: Any, what: str) -> None:
     )
 
 
+class _DocField[T](property):
+    """A deal-document field whose accessors carry no logic of their own.
+
+    Reads ``_data[camel]`` unless an edit has already been recorded under
+    ``snake``, and a write records one. Program and Layer each declare a dozen
+    of these; a field that parses, coerces or validates keeps its hand-written
+    property instead.
+    """
+
+    def __init__(self, snake: str, camel: str, doc: str) -> None:
+        def read(owner: Any) -> Any:
+            if snake in owner._modifications:
+                return owner._modifications[snake]
+            return owner._data.get(camel)
+
+        def write(owner: Any, value: Any) -> None:
+            owner._modifications[snake] = value
+
+        super().__init__(read, write, None, doc)
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> T:
+        # Plain delegation to property. Declared only so a type checker reports
+        # each field's own type; a bare property subclass would give them Any.
+        return super().__get__(obj, objtype)
+
+
 class CustomDataMixin:
     """Custom fields and custom tables for one level of the deal document.
 
@@ -434,6 +460,12 @@ class CustomDataMixin:
             if key not in self._MANAGED_DOCUMENT_KEYS
         )
 
+    def _document_rows(self, name: str, camel_name: str) -> list[dict[str, Any]]:
+        """The document's rows for a collection, with any edit applied."""
+        if name in self._modifications:
+            return self._modifications[name] or []
+        return self._data.get(camel_name) or []
+
     def get_custom_field(self, field_name: str) -> Any:
         """
         Get a custom field value by name (original name as defined in Foundation).
@@ -615,6 +647,42 @@ class CustomDataMixin:
         return any(info["snake_case_name"] == name for info in self._custom_tables_info)
 
     # --- document round-trip ----------------------------------------------
+
+    def _apply_scalar_modification(
+        self, result: dict[str, Any], key: str, value: Any
+    ) -> None:
+        """Write one edited plain field into ``result``, serializing dates.
+
+        _document_key, not a bare fold: a key whose name ends in an acronym
+        (dcfID) folds to something else (dcfId), and writing that would add a
+        second key the server ignores.
+        """
+        camel_key = self._document_key(key) or snake_to_camel(key)
+        # Convert date/datetime objects to ISO strings for JSON serialization
+        if isinstance(value, datetime):
+            result[camel_key] = to_wire_datetime(value)
+        elif isinstance(value, date):
+            result[camel_key] = f"{value}T00:00:00"
+        else:
+            result[camel_key] = value
+
+    def _apply_dirty_tables(self, result: dict[str, Any]) -> None:
+        """Fold every edited custom table into ``result``.
+
+        The edited tables are re-applied on every call rather than consumed by
+        the first one: a single export calls get_json() twice -- once to hash
+        the deal document, once to build the request body -- and consuming them
+        made the two calls disagree, which both sent the un-edited table and
+        cost a second export. Reading a table through as_pandas() marks it
+        edited, so an in-place edit to the frame it returns is covered without
+        re-applying every table.
+        """
+        for table_name in self._custom_table_dirty:
+            table = self._custom_tables.get(table_name)
+            if table is None:
+                continue
+            rows = table.to_records()
+            self._update_custom_table_in_json(result, table_name, rows)
 
     def _update_custom_field_in_json(
         self, result: dict[str, Any], field_name: str, value: Any

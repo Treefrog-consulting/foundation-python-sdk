@@ -48,8 +48,3 @@ class User(BaseModel):
     def email(self) -> str | None:
         """Email address."""
         return self._data.get("email")
-
-    @property
-    def active_flag(self) -> bool | None:
-        """Whether the user account is active."""
-        return self._data.get("activeFlag")

@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Sequence
-from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
 from ..utils import require
+from .custom_table import _frame_to_rows, _rows_to_pandas, _rows_to_polars
 
 if TYPE_CHECKING:
     import pandas as pd  # pragma: no cover - for type checking only
@@ -105,15 +105,8 @@ class ModuleCustomTable:
         """
         self._ensure_loaded()
 
-        pd = require("pandas", "as_pandas")
         if self._frame is None:
-            frame = pd.DataFrame(self._rows)
-            if self._column_names:
-                if frame.empty:
-                    frame = pd.DataFrame(columns=self._column_names)
-                else:
-                    frame = frame.reindex(columns=self._column_names)
-            self._frame = frame
+            self._frame = _rows_to_pandas(self._rows, self._column_names)
 
         return self._frame
 
@@ -131,78 +124,27 @@ class ModuleCustomTable:
 
         Note: Changes to the DataFrame are local only and won't be saved to the backend.
         """
-        pl = require("polars", "as_polars")
+        # Report the missing extra before paying for the fetch.
+        require("polars", "as_polars")
 
         self._ensure_loaded()
-        # to_records() deep-copies so its callers can mutate; this builds fresh
-        # dicts below anyway, so read the live rows directly.
+        # to_records() deep-copies so its callers can mutate; the polars build
+        # makes fresh dicts anyway, so read the live rows directly.
         rows = (
-            self._frame_to_rows(self._frame)
+            _frame_to_rows(self._frame)
             if self._frame is not None
             else (self._rows or [])
         )
 
-        if not rows:
-            return pl.DataFrame(schema={c: pl.Null for c in self._column_names})
-
-        # datetime is a subclass of date, so compare the exact type.
-        normalized = [
-            {
-                # A date-only cell widened so polars can hold one column
-                # type; naive on purpose, the server stored no time.
-                key: datetime(value.year, value.month, value.day)  # noqa: DTZ001
-                if type(value) is date
-                else value
-                for key, value in row.items()
-            }
-            for row in rows
-        ]
-
-        frame = pl.DataFrame(normalized, infer_schema_length=None)
-
-        # A column whose valueType the SDK cannot map is absent from the rows
-        # but still declared, so add it back as null rather than raising.
-        if self._column_names:
-            frame = frame.select(
-                [
-                    pl.col(c) if c in frame.columns else pl.lit(None).alias(c)
-                    for c in self._column_names
-                ]
-            )
-        return frame
+        return _rows_to_polars(rows, self._column_names)
 
     def to_records(self) -> list[dict[str, Any]]:
         """Return table data as a list of dictionaries."""
         self._ensure_loaded()
 
         if self._frame is not None:
-            return self._frame_to_rows(self._frame)
+            return _frame_to_rows(self._frame)
         return copy.deepcopy(self._rows) if self._rows else []
-
-    def _frame_to_rows(self, frame: pd.DataFrame) -> list[dict[str, Any]]:
-        """Convert a DataFrame into list-of-dict records with None for missing values."""
-        if frame.empty:
-            return []
-        pd = require("pandas", "this table")
-        sanitized = frame.where(pd.notna(frame), None)
-        return sanitized.to_dict(orient="records")
-
-    def __dir__(self):
-        """Return list of available attributes for autocomplete."""
-        attrs = set(super().__dir__())
-        attrs.update(
-            [
-                "name",
-                "snake_case_name",
-                "columns",
-                "row_count",
-                "as_pandas",
-                "as_polars",
-                "to_records",
-                "describe",
-            ]
-        )
-        return sorted(attrs)
 
     def describe(self) -> None:
         """Display a summary of this module custom table.

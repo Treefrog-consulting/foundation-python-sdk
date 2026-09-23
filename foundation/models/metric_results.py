@@ -5,9 +5,6 @@ from typing import TYPE_CHECKING, Any
 from ._loss_export import _LossExportAccessor
 
 if TYPE_CHECKING:
-    import pandas as pd
-    import polars as pl
-
     from .run_configuration import RunConfiguration
 
 
@@ -22,6 +19,8 @@ class MetricResults(_LossExportAccessor):
 
     Provides the values shown on the Metrics grid of the deal's Loss Analysis tab
     for a specific layer -- Share EL, ROL, Combined Ratio and so on.
+
+    Columns: metric_id, metric_name, source_name, value.
 
     Calling the accessor directly returns a Polars DataFrame by default:
 
@@ -52,33 +51,6 @@ class MetricResults(_LossExportAccessor):
     """
 
     _noun = "metric results"
-
-    def as_polars(self, run_config: "RunConfiguration") -> "pl.DataFrame":
-        """Get metric results as a Polars DataFrame.
-
-        Returns:
-            Polars DataFrame with metric results for this layer.
-            Columns: metric_id, metric_name, source_name, value.
-
-        Raises:
-            ImportError: If polars is not installed.
-            RuntimeError: If the API call fails, data cannot be loaded,
-                         or metric results are not available.
-        """
-        return super().as_polars(run_config)
-
-    def as_pandas(self, run_config: "RunConfiguration") -> "pd.DataFrame":
-        """Get metric results as a pandas DataFrame.
-
-        Returns:
-            pandas DataFrame with metric results for this layer.
-
-        Raises:
-            ImportError: If pandas is not installed.
-            RuntimeError: If the API call fails, data cannot be loaded,
-                         or metric results are not available.
-        """
-        return super().as_pandas(run_config)
 
     def get_by_name(self, run_config: "RunConfiguration", name: str) -> str | None:
         """Get one metric's result by its Deal Module name.

@@ -1,15 +1,8 @@
 """Layered losses accessor for layers."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ._loss_export import _LossExportAccessor
-
-if TYPE_CHECKING:
-    import pandas as pd
-    import polars as pl
-
-    from .run_configuration import RunConfiguration
-
 
 _LAYERED_LOSSES_COLUMNS = (
     "year, sequence, event_id, region_id, peril_id, model_id, "
@@ -34,6 +27,10 @@ class LayeredLosses(_LossExportAccessor):
     This class provides access to layered loss data for a specific layer.
     It handles caching of the DuckDB file and lazy loading of data.
 
+    Columns: year, sequence, event_id, region_id, peril_id, model_id, loss,
+    rip_amt, rip_pct, rip_brok_amt, rip_brok_pct, lob. lob is null for losses
+    without a line of business.
+
     Calling the accessor directly returns a Polars DataFrame by default:
 
         >>> config = RunConfiguration(sim_years=10000, vendor_id=1, currency_code="USD")
@@ -47,33 +44,6 @@ class LayeredLosses(_LossExportAccessor):
     """
 
     _noun = "losses"
-
-    def as_polars(self, run_config: "RunConfiguration") -> "pl.DataFrame":
-        """Get layered losses as a Polars DataFrame.
-
-        Returns:
-            Polars DataFrame with layered losses for this layer.
-            Columns: year, sequence, event_id, region_id, peril_id, model_id,
-                    loss, rip_amt, rip_pct, rip_brok_amt, rip_brok_pct, lob.
-            lob is null for losses without a line of business.
-
-        Raises:
-            ImportError: If polars is not installed.
-            RuntimeError: If the API call fails or data cannot be loaded.
-        """
-        return super().as_polars(run_config)
-
-    def as_pandas(self, run_config: "RunConfiguration") -> "pd.DataFrame":
-        """Get layered losses as a pandas DataFrame.
-
-        Returns:
-            pandas DataFrame with layered losses for this layer.
-
-        Raises:
-            ImportError: If pandas is not installed.
-            RuntimeError: If the API call fails or data cannot be loaded.
-        """
-        return super().as_pandas(run_config)
 
     def _read_frame(self, con: Any, format_method: str) -> Any:
         select = (

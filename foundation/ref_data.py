@@ -87,60 +87,41 @@ class ReferenceDataCache:
         """
         self._deal_ref = deal_ref_data or {}
         self._common_ref = common_ref_data or {}
-        self._clients = self._index_values(clients_data or [])
+        self._loss_ref = loss_ref_data or {}
 
         # code/name lookup indexes, built per table on first lookup and keyed
         # by the identity of that table's by-ID dict
         self._string_indexes: dict[int, dict[str, dict[str, Any]]] = {}
+        # by-ID indexes, built per table on first lookup and held for the
+        # session, so a table's index keeps one identity
+        self._by_id_indexes: dict[str, dict[Any, dict[str, Any]]] = {}
 
-        deal_ref = self._deal_ref
-        common_ref = self._common_ref
+        # Clients, roles and users arrive from their own endpoints; wrap each in
+        # the /api/ref envelope shape so every reference table reads through one
+        # path.
+        self._payloads = {
+            DEAL: self._deal_ref,
+            COMMON: self._common_ref,
+            LOSS: self._loss_ref,
+            CLIENTS: {"clients": {"values": clients_data or []}},
+            IDENTITY: {
+                "roles": {"values": roles_data or []},
+                "users": {"values": users_data or []},
+            },
+        }
 
-        # Index Deal Module reference data by ID for a quick lookup
-        self._brokers = self._index_values(ref_values(deal_ref, "broker"))
-        self._broker_offices = self._index_values(ref_values(deal_ref, "brokerOffice"))
-        self._currencies = self._index_values(ref_values(deal_ref, "currency"))
-        self._units_of_measure = self._index_values(
-            ref_values(deal_ref, "unitOfMeasure")
-        )
-        self._layer_statuses = self._index_values(ref_values(deal_ref, "layerStatus"))
-        self._layer_limit_attach_types = self._index_values(
-            ref_values(deal_ref, "layerLimitAttachType")
-        )
-        self._layer_premium_types = self._index_values(
-            ref_values(deal_ref, "layerPremiumType")
-        )
-        self._custom_fields = self._index_values(ref_values(deal_ref, "customField"))
-        self._custom_tables = self._index_values(
-            ref_values(deal_ref, "customTableDefinitions")
-        )
+        # Read off the cache directly by Layer and by the custom-table walk in
+        # _init_helpers, so these three keep an attribute of their own.
+        self._custom_tables = self._by_id("custom_table_definitions")
+        self._layer_limit_attach_types = self._by_id("layer_limit_attach_types")
+        self._layer_premium_types = self._by_id("layer_premium_types")
+
         self._custom_table_columns = ref_values(
-            deal_ref, "customTableColumnDefinitions"
+            self._deal_ref, "customTableColumnDefinitions"
         )
-        self._participants = self._index_values(ref_values(deal_ref, "participant"))
-        self._participant_statuses = self._index_values(
-            ref_values(deal_ref, "participantStatus")
-        )
-        self._reinst_prem_bases = self._index_values(
-            ref_values(deal_ref, "reinstPremBase")
-        )
-        self._layer_order_term_types = self._index_values(
-            ref_values(deal_ref, "layerOrderTermType")
-        )
-        self._categories = self._index_values(ref_values(deal_ref, "category"))
-        self._category_details = self._index_values(
-            ref_values(deal_ref, "categoryDetail")
-        )
-        self._external_ref_types = self._index_values(
-            ref_values(deal_ref, "externalRefType")
-        )
-
-        # Index Common Module reference data
-        self._perils = self._index_values(ref_values(common_ref, "peril"))
-        self._regions = self._index_values(ref_values(common_ref, "region"))
 
         # Index model view details for model ID lookup by model view ID
-        self._model_view_details = ref_values(common_ref, "modelViewDetail")
+        self._model_view_details = ref_values(self._common_ref, "modelViewDetail")
         self._model_ids_by_view_id = self._build_model_ids_by_view_id(
             self._model_view_details
         )
@@ -150,33 +131,6 @@ class ReferenceDataCache:
         self._reverse_lookup_maps: dict[int, dict[str, Any]] = {}
         self._accessible_objects: dict[int, dict[str, Any]] = {}
         self._build_lookup_maps(accessible_objects_data or {})
-
-        # Loss-module reference data (used by loss-set upload for
-        # string-name -> ID resolution). Index by id + name for O(1) lookup,
-        # matching the Peril / Region / Participant pattern.
-        loss_ref = self._loss_ref = loss_ref_data or {}
-        # Clients arrive from their own endpoint; wrap them in the same envelope
-        # shape so every reference table reads through one path.
-        self._payloads = {
-            DEAL: self._deal_ref,
-            COMMON: self._common_ref,
-            LOSS: loss_ref,
-            CLIENTS: {"clients": {"values": clients_data or []}},
-            IDENTITY: {
-                "roles": {"values": roles_data or []},
-                "users": {"values": users_data or []},
-            },
-        }
-        self._vendors = self._index_values(ref_values(loss_ref, "vendor"))
-        self._variants = self._index_values(ref_values(loss_ref, "variant"))
-        self._perspectives = self._index_values(ref_values(loss_ref, "perspective"))
-        self._event_sets = self._index_values(ref_values(loss_ref, "eventSet"))
-
-        # Identity roles and users. Their ids are GUID strings rather than ints;
-        # _index_values folds string keys and _lookup_ref tries the id index
-        # before the name one, so a GUID resolves like any other identifier.
-        self._roles = self._index_values(roles_data or [])
-        self._users = self._index_values(users_data or [])
 
         # Reference tables are built on first access and kept for the session.
         self._ref_tables: dict[str, ReferenceTable] = {}
@@ -221,6 +175,24 @@ class ReferenceDataCache:
         table = ReferenceTable(rows, factory, name)
         self._ref_tables[name] = table
         return table
+
+    def _by_id(self, name: str) -> dict[Any, dict[str, Any]]:
+        """A reference table's raw rows indexed by ID, built on first use.
+
+        Held for the session: :meth:`_string_index` caches against the identity
+        of this dict, so a table must always hand back the same one.
+
+        Args:
+            name: Property name, e.g. "brokers" (see _reference_tables.py)
+        """
+        indexed = self._by_id_indexes.get(name)
+        if indexed is None:
+            source, payload_key, _ = REFERENCE_TABLES[name]
+            indexed = self._index_values(
+                ref_values(self._payloads[source], payload_key)
+            )
+            self._by_id_indexes[name] = indexed
+        return indexed
 
     @staticmethod
     def _build_model_ids_by_view_id(
@@ -271,9 +243,11 @@ class ReferenceDataCache:
             if not pk_field or not display_field:
                 continue
 
-            # The API lowercases the first letter of field names in the response
-            pk_key = self._lowercase_first_letter(pk_field)
-            display_key = self._lowercase_first_letter(display_field)
+            # The API lowercases the first letter of field names in the
+            # response, mirroring the .NET LowercaseFirstLetter utility
+            # AccessibleObjectsController serialises them through.
+            pk_key = pk_field[0].lower() + pk_field[1:]
+            display_key = display_field[0].lower() + display_field[1:]
 
             forward: dict[Any, str] = {}
             reverse: dict[str, Any] = {}
@@ -287,17 +261,6 @@ class ReferenceDataCache:
 
             self._lookup_maps[ao_id] = forward
             self._reverse_lookup_maps[ao_id] = reverse
-
-    @staticmethod
-    def _lowercase_first_letter(s: str) -> str:
-        """Lowercase the first character of a string.
-
-        Mirrors the .NET LowercaseFirstLetter utility used by
-        AccessibleObjectsController to serialize field names.
-        """
-        if not s:
-            return s
-        return s[0].lower() + s[1:]
 
     def resolve_lookup_value(self, accessible_object_id: int, raw_value: Any) -> Any:
         """Resolve a raw lookup ID to its display label.
@@ -361,6 +324,14 @@ class ReferenceDataCache:
             return str(result)
         return display_value
 
+    def lookup_values(self, accessible_object_id: int) -> dict[Any, str] | None:
+        """raw ID -> label for an accessible object; None if it is not loaded."""
+        return self._lookup_maps.get(accessible_object_id)
+
+    def add_lookup_objects(self, accessible_objects_data: dict[str, Any]) -> None:
+        """Load more accessible objects, in the shape _build_lookup_maps takes."""
+        self._build_lookup_maps(accessible_objects_data)
+
     def get_model_ids_by_view_id(self, model_view_id: int) -> list[int]:
         """Get list of model IDs for a given model view ID.
 
@@ -379,9 +350,21 @@ class ReferenceDataCache:
         model_cls: Callable[[dict[str, Any]], Any],
     ) -> Any | None:
         """Resolve a reference row by ID, code or name and wrap it in a model."""
-        return self._lookup_ref(
-            identifier, by_id, self._string_index(by_id, model_cls), model_cls
-        )
+        # bool is a subclass of int, so True would otherwise resolve row 1.
+        if isinstance(identifier, bool):
+            return None
+        if isinstance(identifier, int):
+            data = by_id.get(identifier)
+        elif isinstance(identifier, str):
+            # A string can be an ID as well as a name: Identity keys roles and
+            # users by GUID. _index_values folds string keys, so the ID index is
+            # tried first, and a GUID cannot collide with a name.
+            folded = identifier.lower()
+            by_name = self._string_index(by_id, model_cls)
+            data = by_id.get(folded) or by_name.get(folded)
+        else:
+            return None
+        return model_cls(data) if data else None
 
     def _string_index(
         self,
@@ -401,8 +384,8 @@ class ReferenceDataCache:
 
         Cached against the identity of the by-ID dict rather than a hand-written
         key, so an index can never be served for the wrong table. Those dicts are
-        instance attributes assigned once in __init__ and held for the lifetime
-        of this cache, so their ids are stable.
+        built once by :meth:`_by_id` and held for the lifetime of this cache, so
+        their ids are stable.
         """
         cached = self._string_indexes.get(id(by_id))
         if cached is None:
@@ -458,27 +441,27 @@ class ReferenceDataCache:
 
     def get_client(self, identifier: int | str) -> Client | None:
         """Get a client by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._clients, Client)
+        return self._lookup(identifier, self._by_id("clients"), Client)
 
     def get_broker(self, identifier: int | str) -> Broker | None:
         """Get broker by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._brokers, Broker)
+        return self._lookup(identifier, self._by_id("brokers"), Broker)
 
     def get_broker_office(self, identifier: int | str) -> BrokerOffice | None:
         """Get broker office by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._broker_offices, BrokerOffice)
+        return self._lookup(identifier, self._by_id("broker_offices"), BrokerOffice)
 
     def get_currency(self, identifier: int | str) -> Currency | None:
         """Get currency by ID, code or name (case-insensitive)."""
-        return self._lookup(identifier, self._currencies, Currency)
+        return self._lookup(identifier, self._by_id("currencies"), Currency)
 
     def get_unit_of_measure(self, identifier: int | str) -> UnitOfMeasure | None:
         """Get a unit of measure by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._units_of_measure, UnitOfMeasure)
+        return self._lookup(identifier, self._by_id("units_of_measure"), UnitOfMeasure)
 
     def get_layer_status(self, identifier: int | str) -> LayerStatus | None:
         """Get layer status by ID, code or name (case-insensitive)."""
-        return self._lookup(identifier, self._layer_statuses, LayerStatus)
+        return self._lookup(identifier, self._by_id("layer_statuses"), LayerStatus)
 
     def get_layer_limit_attach_type(
         self, identifier: int | str
@@ -494,7 +477,7 @@ class ReferenceDataCache:
 
     def get_custom_field(self, identifier: int | str) -> CustomField | None:
         """Get custom field definition by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._custom_fields, CustomField)
+        return self._lookup(identifier, self._by_id("custom_fields"), CustomField)
 
     def get_custom_table(self, identifier: int | str) -> CustomTableDefinition | None:
         """Get custom table definition by ID or name (case-insensitive)."""
@@ -514,31 +497,35 @@ class ReferenceDataCache:
             >>> participant = cache.get_participant(1)  # By ID
             >>> participant = cache.get_participant("Company X")  # By name
         """
-        return self._lookup(identifier, self._participants, Participant)
+        return self._lookup(identifier, self._by_id("participants"), Participant)
 
     def get_participant_status(self, identifier: int | str) -> ParticipantStatus | None:
         """Get participant status by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._participant_statuses, ParticipantStatus)
+        return self._lookup(
+            identifier, self._by_id("participant_statuses"), ParticipantStatus
+        )
 
     def get_reinst_prem_base(self, identifier: int | str) -> ReinstPremBase | None:
         """Get reinstatement premium base by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._reinst_prem_bases, ReinstPremBase)
+        return self._lookup(
+            identifier, self._by_id("reinst_prem_bases"), ReinstPremBase
+        )
 
     def get_layer_order_term_type(
         self, identifier: int | str
     ) -> LayerOrderTermType | None:
         """Get layer order term type by ID or name (case-insensitive)."""
         return self._lookup(
-            identifier, self._layer_order_term_types, LayerOrderTermType
+            identifier, self._by_id("layer_order_term_types"), LayerOrderTermType
         )
 
     def get_category(self, identifier: int | str) -> Category | None:
         """Get category by ID, code or name (case-insensitive)."""
-        return self._lookup(identifier, self._categories, Category)
+        return self._lookup(identifier, self._by_id("categories"), Category)
 
     def get_category_detail(self, identifier: int | str) -> CategoryDetail | None:
         """Get category detail by ID, code or name (case-insensitive)."""
-        return self._lookup(identifier, self._category_details, CategoryDetail)
+        return self._lookup(identifier, self._by_id("category_details"), CategoryDetail)
 
     def active_categories(self) -> list[Category]:
         """Every category a deal can carry, in the platform's display order.
@@ -588,7 +575,7 @@ class ReferenceDataCache:
             wanted = _DEFINITION_LEVELS.get(level, frozenset({level}))
             known = {
                 field_id: field_def
-                for field_id, field_def in self._custom_fields.items()
+                for field_id, field_def in self._by_id("custom_fields").items()
                 if (field_def.get("level") in wanted)
                 or (field_def.get("level") not in _KNOWN_DEFINITION_LEVELS)
             }
@@ -655,7 +642,9 @@ class ReferenceDataCache:
 
     def get_external_ref_type(self, identifier: int | str) -> ExternalRefType | None:
         """Get external ref type by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._external_ref_types, ExternalRefType)
+        return self._lookup(
+            identifier, self._by_id("external_ref_types"), ExternalRefType
+        )
 
     def get_custom_table_columns(self, table_id: int) -> list[dict[str, Any]]:
         """Get column definitions for a custom table.
@@ -688,7 +677,7 @@ class ReferenceDataCache:
             >>> peril = cache.get_peril("EQ")          # By code
             >>> peril = cache.get_peril("Earthquake")  # By name
         """
-        return self._lookup(identifier, self._perils, Peril)
+        return self._lookup(identifier, self._by_id("perils"), Peril)
 
     def get_region(self, identifier: int | str) -> Region | None:
         """
@@ -705,7 +694,9 @@ class ReferenceDataCache:
             >>> region = cache.get_region("NA")   # By code
         """
         # Region is the only reference model that also takes the cache.
-        return self._lookup(identifier, self._regions, lambda row: Region(row, self))
+        return self._lookup(
+            identifier, self._by_id("regions"), lambda row: Region(row, self)
+        )
 
     def get_all_regions(self) -> list[Region]:
         """
@@ -717,27 +708,27 @@ class ReferenceDataCache:
         Returns:
             List of all Region instances
         """
-        return [Region(data, self) for data in self._regions.values()]
+        return [Region(data, self) for data in self._by_id("regions").values()]
 
     def get_vendor(self, identifier: int | str) -> Vendor | None:
         """Get vendor by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._vendors, Vendor)
+        return self._lookup(identifier, self._by_id("vendors"), Vendor)
 
     def get_variant(self, identifier: int | str) -> Variant | None:
         """Get variant by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._variants, Variant)
+        return self._lookup(identifier, self._by_id("variants"), Variant)
 
     def get_perspective(self, identifier: int | str) -> Perspective | None:
         """Get perspective by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._perspectives, Perspective)
+        return self._lookup(identifier, self._by_id("perspectives"), Perspective)
 
     def get_event_set(self, identifier: int | str) -> EventSet | None:
         """Get event set by ID or name (case-insensitive)."""
-        return self._lookup(identifier, self._event_sets, EventSet)
+        return self._lookup(identifier, self._by_id("event_sets"), EventSet)
 
     def get_role(self, identifier: str | None) -> Role | None:
         """Get an Identity role by its GUID or name (case-insensitive)."""
-        return self._lookup(identifier, self._roles, Role)
+        return self._lookup(identifier, self._by_id("roles"), Role)
 
     def get_user(self, identifier: str | None) -> User | None:
         """Get an Identity user by GUID, email, or "First Last" name.
@@ -745,7 +736,7 @@ class ReferenceDataCache:
         The lookup is case-insensitive. Returns None when the identifier is
         None, so a caller can pass an unassigned ``userId`` straight through.
         """
-        return self._lookup(identifier, self._users, User)
+        return self._lookup(identifier, self._by_id("users"), User)
 
     def active_program_roles(self) -> list[Role]:
         """Every role a deal can assign, in the platform's display order.
@@ -756,28 +747,6 @@ class ReferenceDataCache:
         return self._active_in_display_order(
             "roles", lambda role: role.program_role_flag
         )
-
-    @staticmethod
-    def _lookup_ref(
-        identifier: int | str | None,
-        by_id: dict[Any, dict[str, Any]],
-        by_name: dict[str, dict[str, Any]],
-        model_cls: Callable[[dict[str, Any]], Any],
-    ) -> Any | None:
-        # bool is a subclass of int, so True would otherwise resolve row 1.
-        if isinstance(identifier, bool):
-            return None
-        if isinstance(identifier, int):
-            data = by_id.get(identifier)
-        elif isinstance(identifier, str):
-            # A string can be an ID as well as a name: Identity keys roles and
-            # users by GUID. _index_values folds string keys, so the ID index is
-            # tried first, and a GUID cannot collide with a name.
-            folded = identifier.lower()
-            data = by_id.get(folded) or by_name.get(folded)
-        else:
-            return None
-        return model_cls(data) if data else None
 
     def build_custom_table_row(
         self, raw_row: dict[str, Any], table_id: int

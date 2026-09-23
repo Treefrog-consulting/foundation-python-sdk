@@ -40,16 +40,6 @@ class Region(BaseModel):
         return self._data.get("parentId")
 
     @property
-    def sort_order(self) -> int | None:
-        """Sort order."""
-        return self._data.get("sortOrder")
-
-    @property
-    def active_flag(self) -> bool | None:
-        """Whether the region is active."""
-        return self._data.get("activeFlag")
-
-    @property
     def unknown_flag(self) -> bool | None:
         """Whether this is an unknown region."""
         return self._data.get("unknownFlag")

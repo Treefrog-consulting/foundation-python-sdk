@@ -6,7 +6,7 @@ from ._frames import RecordFrames
 from .run_configuration import RunConfiguration
 
 
-class RunConfigurations(RecordFrames):
+class RunConfigurations(RecordFrames, list):
     """Collection of run configurations for a program.
 
     Provides access to pre-configured analyses that have been saved in
@@ -40,9 +40,7 @@ class RunConfigurations(RecordFrames):
         Args:
             analyses_data: List of analysis dictionaries from analysesByProgram API.
         """
-        self._configurations = [
-            RunConfiguration.from_dict(data) for data in analyses_data
-        ]
+        super().__init__(RunConfiguration.from_dict(data) for data in analyses_data)
 
     def get_by_label(self, label: str) -> RunConfiguration | None:
         """Get a run configuration by its label.
@@ -59,29 +57,10 @@ class RunConfigurations(RecordFrames):
             ...     print(f"Using configuration: {config.label}")
             ...     losses = layer.layered_losses.as_polars(config)
         """
-        for config in self._configurations:
+        for config in self:
             if config.label == label:
                 return config
         return None
-
-    def __iter__(self):
-        """Iterate over all run configurations."""
-        return iter(self._configurations)
-
-    def __len__(self) -> int:
-        """Get the number of run configurations."""
-        return len(self._configurations)
-
-    def __getitem__(self, index: int) -> RunConfiguration:
-        """Get a run configuration by index.
-
-        Args:
-            index: Index of the configuration to retrieve.
-
-        Returns:
-            RunConfiguration instance at the given index.
-        """
-        return self._configurations[index]
 
     def _to_records(self) -> list[dict]:
         return [
@@ -96,7 +75,7 @@ class RunConfigurations(RecordFrames):
                 "participant_id": c.participant_id,
                 "analysis_type": c.analysis_type,
             }
-            for c in self._configurations
+            for c in self
         ]
 
     def describe(self) -> None:
@@ -106,14 +85,14 @@ class RunConfigurations(RecordFrames):
             >>> program.run_configurations.describe()
         """
         print("=" * 80)
-        print(f"RUN CONFIGURATIONS ({len(self._configurations)} configurations)")
+        print(f"RUN CONFIGURATIONS ({len(self)} configurations)")
         print("=" * 80)
         print()
         print(
             f"  {'Label':<25} {'Sim Years':<12} {'Vendor':<10} {'Currency':<10} {'Analysis':<10}"
         )
         print(f"  {'-' * 25} {'-' * 12} {'-' * 10} {'-' * 10} {'-' * 10}")
-        for c in self._configurations:
+        for c in self:
             label = c.label or "(unlabeled)"
             print(
                 f"  {str(label)[:23]:<25} {c.sim_years!s:<12} "
@@ -130,7 +109,5 @@ class RunConfigurations(RecordFrames):
 
     def __repr__(self) -> str:
         """String representation of the collection."""
-        labels = [c.label or "(unlabeled)" for c in self._configurations]
-        return (
-            f"RunConfigurations({len(self._configurations)} configurations: {labels})"
-        )
+        labels = [c.label or "(unlabeled)" for c in self]
+        return f"RunConfigurations({len(self)} configurations: {labels})"

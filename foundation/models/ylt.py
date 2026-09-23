@@ -1,14 +1,8 @@
 """YLT (Year Loss Table) accessor for layers."""
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ._loss_export import _LossExportAccessor
-
-if TYPE_CHECKING:
-    import pandas as pd
-    import polars as pl
-
-    from .run_configuration import RunConfiguration
 
 
 class Ylt(_LossExportAccessor):
@@ -16,6 +10,9 @@ class Ylt(_LossExportAccessor):
 
     This class provides access to YLT custom field data for a specific layer.
     It handles caching of the DuckDB file and lazy loading of data.
+
+    Columns: year, loss, rip_amt, rip_pct, rip_brok_amt, rip_brok_pct, followed by
+    one column per YLT custom field on the layer.
 
     Calling the accessor directly returns a Polars DataFrame by default:
 
@@ -30,34 +27,6 @@ class Ylt(_LossExportAccessor):
     """
 
     _noun = "YLT data"
-
-    def as_polars(self, run_config: "RunConfiguration") -> "pl.DataFrame":
-        """Get YLT data as a Polars DataFrame.
-
-        Returns:
-            Polars DataFrame with YLT data for this layer.
-            Columns: year, loss, rip_amt, rip_pct, rip_brok_amt, rip_brok_pct,
-                    [custom_field_1], [custom_field_2], ...
-
-        Raises:
-            ImportError: If polars is not installed.
-            RuntimeError: If the API call fails, data cannot be loaded,
-                         or YLT table doesn't exist.
-        """
-        return super().as_polars(run_config)
-
-    def as_pandas(self, run_config: "RunConfiguration") -> "pd.DataFrame":
-        """Get YLT data as a pandas DataFrame.
-
-        Returns:
-            pandas DataFrame with YLT data for this layer.
-
-        Raises:
-            ImportError: If pandas is not installed.
-            RuntimeError: If the API call fails, data cannot be loaded,
-                         or YLT table doesn't exist.
-        """
-        return super().as_pandas(run_config)
 
     def _read_frame(self, con: Any, format_method: str) -> Any:
         self._require_table(con, "ylt_losses")

@@ -1,5 +1,6 @@
 """Run configuration for loss export."""
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -26,6 +27,7 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+@dataclass(kw_only=True, eq=False, repr=False)
 class RunConfiguration:
     """Configuration for running loss analysis.
 
@@ -35,6 +37,28 @@ class RunConfiguration:
     Every argument is keyword-only, and the nine through ``analysis_type`` are
     required: six of them are bare ints, so a positional call could transpose
     two and export a different analysis without any error.
+
+    Args:
+        sim_years: Number of simulation years (required).
+        vendor_id: Vendor ID (e.g., 1 for AIR) (required).
+        currency_code: Currency code (e.g., "USD") (required).
+        variant_id: Variant identifier (required).
+        event_set_id: Event set identifier (required).
+        perspective_id: Perspective identifier (required).
+        participant_id: Participant to filter by (required, can be None for all participants).
+        model_ids: List of model IDs to include (required, can be empty list for all models).
+        analysis_type: Analysis type (required).
+        event_split_view_id: Optional event split view identifier.
+        apply_loss_splits_flag: Optional flag for whether to apply loss splits.
+        as_of_date: Optional as-of date for analysis.
+        claim_amount: Optional claim amount setting.
+        historical_flag: Optional flag to include historical events.
+        distribute_claims: Optional flag to compute secondary uncertainty on claims (Blended/Claims-only analyses).
+        event_list: Optional list of specific events to include.
+        claims_history_values: Optional claims history configuration. When
+            distribute_claims is set, each claims row's "Base CoV" entry here
+            drives the secondary uncertainty.
+        label: Optional label for this configuration (e.g., "Default", "LabelB").
 
     Example:
         >>> config = RunConfiguration(
@@ -55,70 +79,24 @@ class RunConfiguration:
         >>> config = program.run_configurations.get_by_label("Default")
     """
 
-    def __init__(
-        self,
-        *,
-        sim_years: int,
-        vendor_id: int,
-        currency_code: str,
-        variant_id: int | None,
-        event_set_id: int | None,
-        perspective_id: int | None,
-        participant_id: int | None,
-        model_ids: list[int],
-        analysis_type: int | None,
-        event_split_view_id: int | None = None,
-        apply_loss_splits_flag: bool | None = None,
-        as_of_date: datetime | None = None,
-        claim_amount: str | None = None,
-        historical_flag: bool | None = None,
-        distribute_claims: bool | None = None,
-        event_list: list[int] | None = None,
-        claims_history_values: dict[str, Any] | None = None,
-        label: str | None = None,
-    ):
-        """Initialize run configuration.
-
-        Args:
-            sim_years: Number of simulation years (required).
-            vendor_id: Vendor ID (e.g., 1 for AIR) (required).
-            currency_code: Currency code (e.g., "USD") (required).
-            variant_id: Variant identifier (required).
-            event_set_id: Event set identifier (required).
-            perspective_id: Perspective identifier (required).
-            participant_id: Participant to filter by (required, can be None for all participants).
-            model_ids: List of model IDs to include (required, can be empty list for all models).
-            analysis_type: Analysis type (required).
-            event_split_view_id: Optional event split view identifier.
-            apply_loss_splits_flag: Optional flag for whether to apply loss splits.
-            as_of_date: Optional as-of date for analysis.
-            claim_amount: Optional claim amount setting.
-            historical_flag: Optional flag to include historical events.
-            distribute_claims: Optional flag to compute secondary uncertainty on claims (Blended/Claims-only analyses).
-            event_list: Optional list of specific events to include.
-            claims_history_values: Optional claims history configuration. When
-                distribute_claims is set, each claims row's "Base CoV" entry here
-                drives the secondary uncertainty.
-            label: Optional label for this configuration (e.g., "Default", "LabelB").
-        """
-        self.sim_years = sim_years
-        self.vendor_id = vendor_id
-        self.currency_code = currency_code
-        self.variant_id = variant_id
-        self.event_set_id = event_set_id
-        self.perspective_id = perspective_id
-        self.participant_id = participant_id
-        self.model_ids = model_ids
-        self.analysis_type = analysis_type
-        self.event_split_view_id = event_split_view_id
-        self.apply_loss_splits_flag = apply_loss_splits_flag
-        self.as_of_date = as_of_date
-        self.claim_amount = claim_amount
-        self.historical_flag = historical_flag
-        self.distribute_claims = distribute_claims
-        self.event_list = event_list
-        self.claims_history_values = claims_history_values
-        self.label = label
+    sim_years: int
+    vendor_id: int
+    currency_code: str
+    variant_id: int | None
+    event_set_id: int | None
+    perspective_id: int | None
+    participant_id: int | None
+    model_ids: list[int]
+    analysis_type: int | None
+    event_split_view_id: int | None = None
+    apply_loss_splits_flag: bool | None = None
+    as_of_date: datetime | None = None
+    claim_amount: str | None = None
+    historical_flag: bool | None = None
+    distribute_claims: bool | None = None
+    event_list: list[int] | None = None
+    claims_history_values: dict[str, Any] | None = None
+    label: str | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RunConfiguration":
@@ -198,35 +176,6 @@ class RunConfiguration:
             Hash value based on configuration parameters.
         """
         return hash(_freeze(self.to_dict()))
-
-    def __dir__(self):
-        """Return list of available attributes for autocomplete."""
-        attrs = set(super().__dir__())
-        attrs.update(
-            [
-                "sim_years",
-                "vendor_id",
-                "currency_code",
-                "variant_id",
-                "event_set_id",
-                "perspective_id",
-                "participant_id",
-                "model_ids",
-                "analysis_type",
-                "event_split_view_id",
-                "apply_loss_splits_flag",
-                "as_of_date",
-                "claim_amount",
-                "historical_flag",
-                "distribute_claims",
-                "event_list",
-                "claims_history_values",
-                "label",
-                "to_dict",
-                "describe",
-            ]
-        )
-        return sorted(attrs)
 
     def describe(self) -> None:
         """Display a comprehensive overview of this run configuration.

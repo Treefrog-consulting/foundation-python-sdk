@@ -22,6 +22,16 @@ class BaseModel:
         """Object name."""
         return self._data.get("name")
 
+    @property
+    def sort_order(self) -> int | None:
+        """Sort order."""
+        return self._data.get("sortOrder")
+
+    @property
+    def active_flag(self) -> bool | None:
+        """Whether the record is active."""
+        return self._data.get("activeFlag")
+
     def __str__(self) -> str:
         """Return the name if available."""
         return (

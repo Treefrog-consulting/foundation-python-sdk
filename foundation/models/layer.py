@@ -1,18 +1,13 @@
 """Layer model"""
 
 import copy
-from datetime import date, datetime
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..exceptions import ReadOnlyVersionError
 from ..ref_data import ReferenceDataCache
-from ..utils import (
-    camel_to_snake,
-    parse_datetime_string,
-    snake_to_camel,
-    to_wire_datetime,
-)
-from ._init_helpers import CustomDataMixin, raise_if_private
+from ..utils import camel_to_snake, parse_datetime_string
+from ._init_helpers import CustomDataMixin, _DocField, raise_if_private
 from .collections import NamedCollection
 from .layer_participant import LayerParticipant
 from .layered_losses import LayeredLosses
@@ -27,6 +22,32 @@ if TYPE_CHECKING:
     from .program_versions import ProgramVersions
     from .reinst_prem_base import ReinstPremBase
     from .unit_of_measure import UnitOfMeasure
+
+
+#: Attribute suffix -> the layerLimitAttach key it reads and writes. Longest
+#: suffix first, so the lookup cannot stop at a shorter one it also ends with.
+_LIMIT_ATTACH_FIELDS = {
+    "_attachment_franchise": "attachmentFranchiseFlag",
+    "_limit_unlimited": "limitUnlimitedFlag",
+    "_limit_binary": "limitBinaryFlag",
+    "_attachment": "attachment",
+    "_limit": "limit",
+}
+
+#: A layerLimitAttach row the payload did not carry, before the edited field
+#: and the type are filled in. "id" is assigned by the API.
+_BLANK_LIMIT_ATTACH: dict[str, Any] = {
+    "id": None,
+    "layerId": None,
+    "layer": None,
+    "layerLimitAttachTypeId": None,
+    "layerLimitAttachType": None,
+    "limit": None,
+    "attachment": None,
+    "limitUnlimitedFlag": False,
+    "limitBinaryFlag": False,
+    "attachmentFranchiseFlag": False,
+}
 
 
 class Layer(CustomDataMixin):
@@ -67,19 +88,10 @@ class Layer(CustomDataMixin):
             )
             if la_type:
                 type_name = camel_to_snake(la_type.name)
-                self._limits_attachments[f"{type_name}_limit"] = la.get("limit")
-                self._limits_attachments[f"{type_name}_attachment"] = la.get(
-                    "attachment"
-                )
-                self._limits_attachments[f"{type_name}_limit_unlimited"] = la.get(
-                    "limitUnlimitedFlag"
-                )
-                self._limits_attachments[f"{type_name}_limit_binary"] = la.get(
-                    "limitBinaryFlag"
-                )
-                self._limits_attachments[f"{type_name}_attachment_franchise"] = la.get(
-                    "attachmentFranchiseFlag"
-                )
+                for suffix, document_key in _LIMIT_ATTACH_FIELDS.items():
+                    self._limits_attachments[f"{type_name}{suffix}"] = la.get(
+                        document_key
+                    )
 
         # Process premiums
         self._premiums = {}
@@ -249,30 +261,15 @@ class Layer(CustomDataMixin):
         """Layer ID (read-only). None if the payload carried none."""
         return self._data.get("id")
 
-    @property
-    def name(self) -> str | None:
-        """Layer name. None when unset -- "" used to stand in for absent."""
-        if "name" in self._modifications:
-            return self._modifications["name"]
-        return self._data.get("name")
+    name = _DocField[str | None](
+        "name",
+        "name",
+        'Layer name. None when unset -- "" used to stand in for absent.',
+    )
+    number = _DocField[int | None]("number", "number", "Layer number.")
 
-    @name.setter
-    def name(self, value: str) -> None:
-        """Set layer name."""
-        self._modifications["name"] = value
-
-    @property
-    def number(self) -> int | None:
-        """Layer number."""
-        if "number" in self._modifications:
-            return self._modifications["number"]
-        return self._data.get("number")
-
-    @number.setter
-    def number(self, value: int | None) -> None:
-        """Set layer number."""
-        self._modifications["number"] = value
-
+    # incept_date and expiry_date parse the stored timestamp, so they keep
+    # their hand-written form.
     @property
     def incept_date(self) -> datetime | None:
         """Inception date."""
@@ -301,133 +298,55 @@ class Layer(CustomDataMixin):
         parsed_value = parse_datetime_string(value)
         self._modifications["expiry_date"] = parsed_value
 
-    @property
-    def note(self) -> str | None:
-        """Layer note."""
-        if "note" in self._modifications:
-            return self._modifications["note"]
-        return self._data.get("note")
-
-    @note.setter
-    def note(self, value: str | None) -> None:
-        """Set layer note."""
-        self._modifications["note"] = value
-
-    @property
-    def limit_percent(self) -> float | None:
-        """Limit percentage."""
-        if "limit_percent" in self._modifications:
-            return self._modifications["limit_percent"]
-        return self._data.get("limitPercent")
-
-    @limit_percent.setter
-    def limit_percent(self, value: float | None) -> None:
-        """Set limit percentage."""
-        self._modifications["limit_percent"] = value
-
-    @property
-    def structure_only_flag(self) -> bool | None:
-        """Whether this is a structure-only layer."""
-        if "structure_only_flag" in self._modifications:
-            return self._modifications["structure_only_flag"]
-        return self._data.get("structureOnlyFlag")
-
-    @structure_only_flag.setter
-    def structure_only_flag(self, value: bool | None) -> None:
-        """Set structure-only flag."""
-        self._modifications["structure_only_flag"] = value
-
-    @property
-    def unlimited_reinst_flag(self) -> bool | None:
-        """Whether reinstatements are unlimited."""
-        if "unlimited_reinst_flag" in self._modifications:
-            return self._modifications["unlimited_reinst_flag"]
-        return self._data.get("unlimitedReinstFlag")
-
-    @unlimited_reinst_flag.setter
-    def unlimited_reinst_flag(self, value: bool | None) -> None:
-        """Set unlimited reinstatement flag."""
-        self._modifications["unlimited_reinst_flag"] = value
-
-    @property
-    def rol_type(self) -> int | None:
-        """Basis the rate on line is quoted on: 1 occurrence, 2 aggregate."""
-        if "rol_type" in self._modifications:
-            return self._modifications["rol_type"]
-        return self._data.get("rolType")
-
-    @rol_type.setter
-    def rol_type(self, value: int | None) -> None:
-        """Set the rate-on-line basis."""
-        self._modifications["rol_type"] = value
-
-    @property
-    def allocate_contrib_events_flag(self) -> bool | None:
+    note = _DocField[str | None]("note", "note", "Layer note.")
+    limit_percent = _DocField[float | None](
+        "limit_percent", "limitPercent", "Limit percentage."
+    )
+    structure_only_flag = _DocField[bool | None](
+        "structure_only_flag",
+        "structureOnlyFlag",
+        "Whether this is a structure-only layer.",
+    )
+    unlimited_reinst_flag = _DocField[bool | None](
+        "unlimited_reinst_flag",
+        "unlimitedReinstFlag",
+        "Whether reinstatements are unlimited.",
+    )
+    rol_type = _DocField[int | None](
+        "rol_type",
+        "rolType",
+        "Basis the rate on line is quoted on: 1 occurrence, 2 aggregate.",
+    )
+    allocate_contrib_events_flag = _DocField[bool | None](
+        "allocate_contrib_events_flag",
+        "allocateContribEventsFlag",
         """Whether loss is allocated across every contributing event.
 
-        When set, each event above the occurrence retention takes a
-        proportional share regardless of aggregate exhaustion -- so two layers
-        with the same limits and attachments can produce different layered
-        losses, and this is the flag that explains it.
-        """
-        if "allocate_contrib_events_flag" in self._modifications:
-            return self._modifications["allocate_contrib_events_flag"]
-        return self._data.get("allocateContribEventsFlag")
-
-    @allocate_contrib_events_flag.setter
-    def allocate_contrib_events_flag(self, value: bool | None) -> None:
-        """Set the contributing-event allocation flag."""
-        self._modifications["allocate_contrib_events_flag"] = value
+    When set, each event above the occurrence retention takes a
+    proportional share regardless of aggregate exhaustion -- so two layers
+    with the same limits and attachments can produce different layered
+    losses, and this is the flag that explains it.
+    """,
+    )
 
     # The reference keys the layer row carries. Each has an enriched read-only
     # counterpart below; these are the settable form, and what a scenario edits.
-    @property
-    def currency_id(self) -> int | None:
-        """ID of the layer's currency. See the currency property for the record."""
-        if "currency_id" in self._modifications:
-            return self._modifications["currency_id"]
-        return self._data.get("currencyId")
-
-    @currency_id.setter
-    def currency_id(self, value: int | None) -> None:
-        """Set the layer's currency."""
-        self._modifications["currency_id"] = value
-
-    @property
-    def unit_of_measure_id(self) -> int | None:
-        """ID of the layer's unit of measure."""
-        if "unit_of_measure_id" in self._modifications:
-            return self._modifications["unit_of_measure_id"]
-        return self._data.get("unitOfMeasureId")
-
-    @unit_of_measure_id.setter
-    def unit_of_measure_id(self, value: int | None) -> None:
-        """Set the layer's unit of measure."""
-        self._modifications["unit_of_measure_id"] = value
-
-    @property
-    def layer_status_id(self) -> int | None:
-        """ID of the layer's status."""
-        if "layer_status_id" in self._modifications:
-            return self._modifications["layer_status_id"]
-        return self._data.get("layerStatusId")
-
-    @layer_status_id.setter
-    def layer_status_id(self, value: int | None) -> None:
-        """Set the layer's status."""
-        self._modifications["layer_status_id"] = value
-
-    @property
-    def reinst_prem_base_id(self) -> int | None:
-        """ID of the layer's reinstatement premium base."""
-        if "reinst_prem_base_id" in self._modifications:
-            return self._modifications["reinst_prem_base_id"]
-        return self._data.get("reinstPremBaseId")
-
-    @reinst_prem_base_id.setter
-    def reinst_prem_base_id(self, value: int | None) -> None:
-        """Set the layer's reinstatement premium base."""
-        self._modifications["reinst_prem_base_id"] = value
+    currency_id = _DocField[int | None](
+        "currency_id",
+        "currencyId",
+        "ID of the layer's currency. See the currency property for the record.",
+    )
+    unit_of_measure_id = _DocField[int | None](
+        "unit_of_measure_id", "unitOfMeasureId", "ID of the layer's unit of measure."
+    )
+    layer_status_id = _DocField[int | None](
+        "layer_status_id", "layerStatusId", "ID of the layer's status."
+    )
+    reinst_prem_base_id = _DocField[int | None](
+        "reinst_prem_base_id",
+        "reinstPremBaseId",
+        "ID of the layer's reinstatement premium base.",
+    )
 
     # Reference data properties (read-only, enriched). Each reads its key
     # through the scalar property above, so an edited id resolves to the row
@@ -486,12 +405,6 @@ class Layer(CustomDataMixin):
         return NamedCollection(
             Reinstatement(r) for r in self._document_rows("layer_reinst", "layerReinst")
         )
-
-    def _document_rows(self, name: str, camel_name: str) -> list[dict[str, Any]]:
-        """The document's rows for a collection, with any edit applied."""
-        if name in self._modifications:
-            return self._modifications[name] or []
-        return self._data.get(camel_name) or []
 
     @property
     def program(self) -> Optional["Program"]:
@@ -570,29 +483,9 @@ class Layer(CustomDataMixin):
             elif key in self._premiums:
                 self._update_premium_in_json(result, key, value)
             else:
-                # Regular field - resolve the document key and serialize dates.
-                # _document_key, not a bare fold: a key whose name ends in an
-                # acronym (dcfID) folds to something else (dcfId), and writing
-                # that would add a second key the server ignores.
-                camel_key = self._document_key(key) or snake_to_camel(key)
-                # Convert date/datetime objects to ISO strings for JSON serialization
-                if isinstance(value, datetime):
-                    result[camel_key] = to_wire_datetime(value)
-                elif isinstance(value, date):
-                    result[camel_key] = f"{value}T00:00:00"
-                else:
-                    result[camel_key] = value
+                self._apply_scalar_modification(result, key, value)
 
-        # Always update custom tables if they have been modified. The edited tables are
-        # re-applied on every call rather than consumed by the first one: a single export
-        # calls get_json() twice -- once to hash the deal document, once to build the
-        # request body -- so consuming them here sent the un-edited table to the server.
-        for table_name in self._custom_table_dirty:
-            table = self._custom_tables.get(table_name)
-            if table is None:
-                continue
-            rows = table.to_records()
-            self._update_custom_table_in_json(result, table_name, rows)
+        self._apply_dirty_tables(result)
 
         return result
 
@@ -622,24 +515,14 @@ class Layer(CustomDataMixin):
         self, result: dict[str, Any], field_name: str, value: Any
     ) -> None:
         """Update a limit or attachment value in the layerLimitAttach array."""
-        # Parse the field name to determine type and field
         # Format: {type_name}_limit, {type_name}_attachment, etc.
-        if field_name.endswith("_limit"):
-            type_name = field_name[: -len("_limit")]
-            field_type = "limit"
-        elif field_name.endswith("_attachment"):
-            type_name = field_name[: -len("_attachment")]
-            field_type = "attachment"
-        elif field_name.endswith("_limit_unlimited"):
-            type_name = field_name[: -len("_limit_unlimited")]
-            field_type = "limitUnlimitedFlag"
-        elif field_name.endswith("_limit_binary"):
-            type_name = field_name[: -len("_limit_binary")]
-            field_type = "limitBinaryFlag"
-        elif field_name.endswith("_attachment_franchise"):
-            type_name = field_name[: -len("_attachment_franchise")]
-            field_type = "attachmentFranchiseFlag"
-        else:
+        document_key = None
+        for suffix, key in _LIMIT_ATTACH_FIELDS.items():
+            if field_name.endswith(suffix):
+                type_name = field_name[: -len(suffix)]
+                document_key = key
+                break
+        if document_key is None:
             return
 
         # Find the layer limit attach type ID
@@ -658,45 +541,16 @@ class Layer(CustomDataMixin):
         found = False
         for la in limit_attach_list:
             if la.get("layerLimitAttachTypeId") == type_id:
-                # Update the appropriate field
-                if field_type == "limit":
-                    la["limit"] = value
-                elif field_type == "attachment":
-                    la["attachment"] = value
-                elif field_type == "limitUnlimitedFlag":
-                    la["limitUnlimitedFlag"] = value
-                elif field_type == "limitBinaryFlag":
-                    la["limitBinaryFlag"] = value
-                elif field_type == "attachmentFranchiseFlag":
-                    la["attachmentFranchiseFlag"] = value
+                la[document_key] = value
                 found = True
                 break
 
         if not found:
             # Add new limit/attachment entry
-            new_entry = {
-                "id": None,  # Will be assigned by API
-                "layerId": result.get("id"),
-                "layer": None,
-                "layerLimitAttachTypeId": type_id,
-                "layerLimitAttachType": None,
-                "limit": None,
-                "attachment": None,
-                "limitUnlimitedFlag": False,
-                "limitBinaryFlag": False,
-                "attachmentFranchiseFlag": False,
-            }
-            # Set the appropriate field
-            if field_type == "limit":
-                new_entry["limit"] = value
-            elif field_type == "attachment":
-                new_entry["attachment"] = value
-            elif field_type == "limitUnlimitedFlag":
-                new_entry["limitUnlimitedFlag"] = value
-            elif field_type == "limitBinaryFlag":
-                new_entry["limitBinaryFlag"] = value
-            elif field_type == "attachmentFranchiseFlag":
-                new_entry["attachmentFranchiseFlag"] = value
+            new_entry = dict(_BLANK_LIMIT_ATTACH)
+            new_entry["layerId"] = result.get("id")
+            new_entry["layerLimitAttachTypeId"] = type_id
+            new_entry[document_key] = value
 
             limit_attach_list.append(new_entry)
             result["layerLimitAttach"] = limit_attach_list

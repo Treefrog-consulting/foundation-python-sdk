@@ -3,50 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
-from ..utils import require, resolve_snake_case_collisions
+from requests.structures import CaseInsensitiveDict
 
-if TYPE_CHECKING:  # pragma: no cover - for type checking only
-    import pandas as pd
-    import polars as pl
-
-
-class _NameIndex(dict):
-    """Case-insensitive lookup keyed by a lowercased string.
-
-    Keys are folded on both write and read, so ``by_name["Aon"]`` and
-    ``by_name["aon"]`` resolve to the same row. This matches the
-    case-insensitive contract of the singular ``get_*`` accessors.
-    """
-
-    @staticmethod
-    def _fold(key: Any) -> Any:
-        return key.lower() if isinstance(key, str) else key
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        super().__setitem__(self._fold(key), value)
-
-    def __getitem__(self, key: Any) -> Any:
-        return super().__getitem__(self._fold(key))
-
-    def __delitem__(self, key: Any) -> None:
-        super().__delitem__(self._fold(key))
-
-    def __contains__(self, key: Any) -> bool:
-        return super().__contains__(self._fold(key))
-
-    def get(self, key: Any, default: Any = None) -> Any:
-        return super().get(self._fold(key), default)
-
-    def pop(self, key: Any, *default: Any) -> Any:
-        return super().pop(self._fold(key), *default)
-
-    def setdefault(self, key: Any, default: Any = None) -> Any:
-        return super().setdefault(self._fold(key), default)
+from ..utils import resolve_snake_case_collisions
+from ._frames import RecordFrames
 
 
-class ReferenceTable(list):
+class ReferenceTable(RecordFrames, list):
     """A reference table: model rows plus id/name/code indexes and DataFrames.
 
     Subclasses ``list``, so iteration, ``len()``, ``in``, ``bool()``, positional
@@ -79,8 +44,10 @@ class ReferenceTable(list):
 
         self._label = label
         self.by_id: dict[Any, Any] = {}
-        self.by_name = _NameIndex()
-        self.by_code = _NameIndex()
+        # Case-insensitive: by_name["Aon"] and by_name["aon"] are the same row,
+        # matching the contract of the singular get_* accessors.
+        self.by_name: CaseInsensitiveDict[Any] = CaseInsensitiveDict()
+        self.by_code: CaseInsensitiveDict[Any] = CaseInsensitiveDict()
 
         for raw, item in zip(active, self, strict=True):
             row_id = raw.get("id")
@@ -138,7 +105,13 @@ class ReferenceTable(list):
         return [key for key in seen if key not in nested]
 
     def to_records(self) -> list[dict[str, Any]]:
-        """Return the table as a list of dicts with snake_case keys."""
+        """Return the table as a list of dicts with snake_case keys.
+
+        Values are the raw server values: a date column arrives as an ISO
+        string, where the model property would give a ``date`` object.
+        ``as_polars()`` and ``as_pandas()`` build their frames from these
+        records, a new one on every call, so edits never leak between callers.
+        """
         rows = self._raw_rows()
         if not rows:
             return []
@@ -147,35 +120,8 @@ class ReferenceTable(list):
         column_names = resolve_snake_case_collisions(keys)
         return [{column_names[key]: row.get(key) for key in keys} for row in rows]
 
-    def as_polars(self) -> pl.DataFrame:
-        """Return the table as a polars DataFrame with snake_case columns.
-
-        A new DataFrame is built on every call, so edits never leak between
-        callers. Values are the raw server values: a date column arrives as an
-        ISO string, where the model property would give a ``date`` object.
-
-        Raises:
-            ImportError: If polars is not installed.
-        """
-        pl = require("polars", "as_polars")
-
-        records = self.to_records()
-        if not records:
-            return pl.DataFrame()
-        return pl.DataFrame(records, infer_schema_length=None)
-
-    def as_pandas(self) -> pd.DataFrame:
-        """Return the table as a pandas DataFrame with snake_case columns.
-
-        Raises:
-            ImportError: If pandas is not installed.
-        """
-        pd = require("pandas", "as_pandas")
-
-        records = self.to_records()
-        if not records:
-            return pd.DataFrame()
-        return pd.DataFrame(records)
+    # What RecordFrames turns into the pandas and polars frames.
+    _to_records = to_records
 
     def describe(self) -> None:
         """Display a summary of the table.

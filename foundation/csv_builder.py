@@ -15,7 +15,11 @@ ColumnSpec = str | Sequence[str]
 
 
 def _normalize_spec(spec: ColumnSpec) -> list[str]:
-    """Accept either a single canonical name or a list of aliases for one slot."""
+    """Accept either a single canonical name or a list of aliases for one slot.
+
+    A str is itself a Sequence[str], so the isinstance check is what stops
+    ``list("SimYear")`` from silently becoming seven single-character aliases.
+    """
     if isinstance(spec, str):
         return [spec]
     aliases = [a for a in spec if a]

@@ -9,12 +9,16 @@ if TYPE_CHECKING:
     from ..ref_data import ReferenceDataCache
 
 
-class ReferenceRuns(RecordFrames):
+class ReferenceRuns(RecordFrames, list[ReferenceRun]):
     """Collection of reference runs from the Deal Module.
 
     Reference runs are pre-stored run configurations that are loaded once
     when the client authenticates and cached for the session. Only active
-    reference runs (activeFlag=True) are included.
+    reference runs (activeFlag=True) are included, ordered by preference
+    group then preference order.
+
+    Subclasses ``list``, so iteration, ``len()``, ``in``, ``bool()``,
+    positional indexing and slicing behave exactly as they do for a list.
 
     ``as_pandas()`` / ``as_polars()`` give a tabular view of all active
     reference runs with their key configuration parameters, in columns: id,
@@ -54,22 +58,19 @@ class ReferenceRuns(RecordFrames):
             reference_runs_data: List of reference run dictionaries from API.
             ref_cache: Reference data cache for resolving model IDs.
         """
-        self._ref_cache = ref_cache
-
         # Filter to only active reference runs and create ReferenceRun objects
-        self._reference_runs = [
+        runs = [
             ReferenceRun.from_dict(data, ref_cache)
             for data in reference_runs_data
             if data.get("activeFlag")
         ]
         # Sort by preference group and preference order
-        self._reference_runs.sort(
-            key=lambda r: (r.preference_group, r.preference_order)
-        )
+        runs.sort(key=lambda r: (r.preference_group, r.preference_order))
+        super().__init__(runs)
         # Index by ID for quick lookup
-        self._by_id = {r.id: r for r in self._reference_runs}
+        self._by_id = {r.id: r for r in runs}
         # Index by name (case-insensitive) for quick lookup
-        self._by_name = {r.name.lower(): r for r in self._reference_runs}
+        self._by_name = {r.name.lower(): r for r in runs}
 
     def get_by_name(self, name: str) -> ReferenceRun | None:
         """Get a reference run by its name.
@@ -104,25 +105,6 @@ class ReferenceRuns(RecordFrames):
         """
         return self._by_id.get(id)
 
-    def __iter__(self):
-        """Iterate over all reference runs."""
-        return iter(self._reference_runs)
-
-    def __len__(self) -> int:
-        """Get the number of reference runs."""
-        return len(self._reference_runs)
-
-    def __getitem__(self, index: int) -> ReferenceRun:
-        """Get a reference run by index.
-
-        Args:
-            index: Index of the reference run to retrieve.
-
-        Returns:
-            ReferenceRun instance at the given index.
-        """
-        return self._reference_runs[index]
-
     def _to_records(self) -> list[dict]:
         return [
             {
@@ -138,7 +120,7 @@ class ReferenceRuns(RecordFrames):
                 "preference_group": r.preference_group,
                 "preference_order": r.preference_order,
             }
-            for r in self._reference_runs
+            for r in self
         ]
 
     def __dir__(self):
@@ -148,7 +130,7 @@ class ReferenceRuns(RecordFrames):
         methods again only creates a second list to keep in step.
         """
         # Add reference run names for tab-completion awareness
-        return sorted(set(super().__dir__()) | {r.name for r in self._reference_runs})
+        return sorted(set(super().__dir__()) | {r.name for r in self})
 
     def describe(self) -> None:
         """Display a summary of available reference runs.
@@ -157,14 +139,14 @@ class ReferenceRuns(RecordFrames):
             >>> client.reference_runs.describe()
         """
         print("=" * 80)
-        print(f"REFERENCE RUNS ({len(self._reference_runs)} active)")
+        print(f"REFERENCE RUNS ({len(self)} active)")
         print("=" * 80)
         print()
         print(
             f"  {'ID':<6} {'Name':<30} {'Sim Years':<12} {'Vendor':<10} {'Group':<8} {'Order':<8}"
         )
         print(f"  {'-' * 6} {'-' * 30} {'-' * 12} {'-' * 10} {'-' * 8} {'-' * 8}")
-        for r in self._reference_runs:
+        for r in self:
             print(
                 f"  {r.id!s:<6} {str(r.name)[:28]:<30} "
                 f"{r.sim_years!s:<12} {r.vendor_id!s:<10} "
@@ -181,5 +163,5 @@ class ReferenceRuns(RecordFrames):
 
     def __repr__(self) -> str:
         """String representation of the collection."""
-        names = [r.name for r in self._reference_runs]
-        return f"ReferenceRuns({len(self._reference_runs)} active runs: {names})"
+        names = [r.name for r in self]
+        return f"ReferenceRuns({len(self)} active runs: {names})"

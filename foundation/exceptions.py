@@ -14,6 +14,7 @@ import requests
 
 if TYPE_CHECKING:
     from .models.loss_set_result import LossGroupUploadResult
+    from .models.rollup_run import RollupRun
 
 #: Server bodies can be a whole HTML error page; keep enough to identify the
 #: failure without turning a traceback into a document.
@@ -144,3 +145,15 @@ class LossGroupAttachError(FoundationError, RuntimeError):
     def __init__(self, message: str, partial_result: LossGroupUploadResult):
         super().__init__(message)
         self.partial_result = partial_result
+
+
+class RollupError(FoundationError, RuntimeError):
+    """A template run failed, was cancelled, or did not finish in time.
+
+    The ``run`` attribute holds the RollupRun, whose ``jobs`` show each job's
+    status and note; the run itself carries on after a timeout.
+    """
+
+    def __init__(self, message: str, run: RollupRun | None = None):
+        super().__init__(message)
+        self.run = run

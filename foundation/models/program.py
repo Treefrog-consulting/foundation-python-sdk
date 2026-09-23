@@ -1,13 +1,11 @@
 """Program model"""
 
 import copy
-from datetime import date, datetime
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..exceptions import ReadOnlyVersionError
 from ..ref_data import ReferenceDataCache
-from ..utils import snake_to_camel, to_wire_datetime
-from ._init_helpers import CustomDataMixin
+from ._init_helpers import CustomDataMixin, _DocField
 from .collections import NamedCollection
 from .layer import Layer
 from .program_broker import ProgramBroker
@@ -120,12 +118,6 @@ class Program(CustomDataMixin):
         roles.extend(ProgramRole(row, self._ref_cache) for row in extras)
         return roles
 
-    def _document_rows(self, name: str, camel_name: str) -> list[dict[str, Any]]:
-        """The document's rows for a collection, with any edit applied."""
-        if name in self._modifications:
-            return self._modifications[name] or []
-        return self._data.get(camel_name) or []
-
     def _edited(self, name: str) -> bool:
         """Whether set_document_field has replaced this collection's rows."""
         return name in self._modifications
@@ -236,156 +228,57 @@ class Program(CustomDataMixin):
         """Program ID (read-only). None if the payload carried none."""
         return self._data.get("id")
 
-    @property
-    def name(self) -> str | None:
-        """Program name. None when unset -- "" used to stand in for absent."""
-        if "name" in self._modifications:
-            return self._modifications["name"]
-        return self._data.get("name")
-
-    @name.setter
-    def name(self, value: str) -> None:
-        """Set program name."""
-        self._modifications["name"] = value
-
-    @property
-    def description(self) -> str | None:
-        """Program description."""
-        if "description" in self._modifications:
-            return self._modifications["description"]
-        return self._data.get("description")
-
-    @description.setter
-    def description(self, value: str | None) -> None:
-        """Set program description."""
-        self._modifications["description"] = value
-
-    @property
-    def uw_year(self) -> int | None:
-        """Underwriting year."""
-        if "uw_year" in self._modifications:
-            return self._modifications["uw_year"]
-        return self._data.get("uwYear")
-
-    @uw_year.setter
-    def uw_year(self, value: int | None) -> None:
-        """Set underwriting year."""
-        self._modifications["uw_year"] = value
-
-    @property
-    def ceded_flag(self) -> bool | None:
-        """Whether the program is ceded."""
-        if "ceded_flag" in self._modifications:
-            return self._modifications["ceded_flag"]
-        return self._data.get("cededFlag")
-
-    @ceded_flag.setter
-    def ceded_flag(self, value: bool | None) -> None:
-        """Set ceded flag."""
-        self._modifications["ceded_flag"] = value
-
-    @property
-    def renewal_flag(self) -> bool | None:
-        """Whether the program is a renewal."""
-        if "renewal_flag" in self._modifications:
-            return self._modifications["renewal_flag"]
-        return self._data.get("renewalFlag")
-
-    @renewal_flag.setter
-    def renewal_flag(self, value: bool | None) -> None:
-        """Set renewal flag."""
-        self._modifications["renewal_flag"] = value
-
-    @property
-    def note(self) -> str | None:
-        """Program note."""
-        if "note" in self._modifications:
-            return self._modifications["note"]
-        return self._data.get("note")
-
-    @note.setter
-    def note(self, value: str | None) -> None:
-        """Set program note."""
-        self._modifications["note"] = value
-
-    @property
-    def years_on_account(self) -> int | None:
-        """Years on account."""
-        if "years_on_account" in self._modifications:
-            return self._modifications["years_on_account"]
-        return self._data.get("yearsOnAccount")
-
-    @years_on_account.setter
-    def years_on_account(self, value: int | None) -> None:
-        """Set years on account."""
-        self._modifications["years_on_account"] = value
-
-    @property
-    def renewed_from_id(self) -> int | None:
+    name = _DocField[str | None](
+        "name",
+        "name",
+        'Program name. None when unset -- "" used to stand in for absent.',
+    )
+    description = _DocField[str | None](
+        "description", "description", "Program description."
+    )
+    uw_year = _DocField[int | None]("uw_year", "uwYear", "Underwriting year.")
+    ceded_flag = _DocField[bool | None](
+        "ceded_flag", "cededFlag", "Whether the program is ceded."
+    )
+    renewal_flag = _DocField[bool | None](
+        "renewal_flag", "renewalFlag", "Whether the program is a renewal."
+    )
+    note = _DocField[str | None]("note", "note", "Program note.")
+    years_on_account = _DocField[int | None](
+        "years_on_account", "yearsOnAccount", "Years on account."
+    )
+    renewed_from_id = _DocField[int | None](
+        "renewed_from_id",
+        "renewedFromId",
         """ID of the deal this one was renewed from ("Renewed From" in the UI).
 
-        None when the deal is not a renewal of another. Use get_previous() to
-        read that deal.
-        """
-        if "renewed_from_id" in self._modifications:
-            return self._modifications["renewed_from_id"]
-        return self._data.get("renewedFromId")
-
-    @renewed_from_id.setter
-    def renewed_from_id(self, value: int | None) -> None:
-        """Set the deal this one was renewed from."""
-        self._modifications["renewed_from_id"] = value
-
-    @property
-    def client_id(self) -> int | None:
-        """ID of the deal's client. See the client property for the full record."""
-        if "client_id" in self._modifications:
-            return self._modifications["client_id"]
-        return self._data.get("clientId")
-
-    @client_id.setter
-    def client_id(self, value: int | None) -> None:
-        """Set the deal's client."""
-        self._modifications["client_id"] = value
-
-    @property
-    def program_group_id(self) -> int | None:
+    None when the deal is not a renewal of another. Use get_previous() to
+    read that deal.
+    """,
+    )
+    client_id = _DocField[int | None](
+        "client_id",
+        "clientId",
+        "ID of the deal's client. See the client property for the full record.",
+    )
+    program_group_id = _DocField[int | None](
+        "program_group_id",
+        "programGroupId",
         """ID of the deal group this deal belongs to ("Program Group" in the UI).
 
-        See client.program_groups for the group names.
-        """
-        if "program_group_id" in self._modifications:
-            return self._modifications["program_group_id"]
-        return self._data.get("programGroupId")
-
-    @program_group_id.setter
-    def program_group_id(self, value: int | None) -> None:
-        """Set the deal group."""
-        self._modifications["program_group_id"] = value
-
-    @property
-    def pricing_portfolio_id(self) -> int | None:
-        """ID of the reference portfolio this deal is priced against."""
-        if "pricing_portfolio_id" in self._modifications:
-            return self._modifications["pricing_portfolio_id"]
-        return self._data.get("pricingPortfolioId")
-
-    @pricing_portfolio_id.setter
-    def pricing_portfolio_id(self, value: int | None) -> None:
-        """Set the reference portfolio."""
-        self._modifications["pricing_portfolio_id"] = value
-
-    @property
-    def pricing_portfolio_src(self) -> int | None:
-        """How the reference portfolio is linked: 1 static, 2 sourced."""
-        if "pricing_portfolio_src" in self._modifications:
-            return self._modifications["pricing_portfolio_src"]
-        return self._data.get("pricingPortfolioSrc")
-
-    @pricing_portfolio_src.setter
-    def pricing_portfolio_src(self, value: int | None) -> None:
-        """Set how the reference portfolio is linked."""
-        self._modifications["pricing_portfolio_src"] = value
+    See client.program_groups for the group names.
+    """,
+    )
+    pricing_portfolio_id = _DocField[int | None](
+        "pricing_portfolio_id",
+        "pricingPortfolioId",
+        "ID of the reference portfolio this deal is priced against.",
+    )
+    pricing_portfolio_src = _DocField[int | None](
+        "pricing_portfolio_src",
+        "pricingPortfolioSrc",
+        "How the reference portfolio is linked: 1 static, 2 sourced.",
+    )
 
     # Reference data properties (read-only, enriched)
     @property
@@ -539,32 +432,9 @@ class Program(CustomDataMixin):
                 # Update the custom field in programCustomFields array
                 self._update_custom_field_in_json(result, key, value)
             else:
-                # Regular field - resolve the document key and serialize dates.
-                # _document_key, not a bare fold: a key whose name ends in an
-                # acronym (dcfID) folds to something else (dcfId), and writing
-                # that would add a second key the server ignores.
-                camel_key = self._document_key(key) or snake_to_camel(key)
-                # Convert date/datetime objects to ISO strings for JSON serialization
-                if isinstance(value, datetime):
-                    result[camel_key] = to_wire_datetime(value)
-                elif isinstance(value, date):
-                    result[camel_key] = f"{value}T00:00:00"
-                else:
-                    result[camel_key] = value
+                self._apply_scalar_modification(result, key, value)
 
-        # The edited tables are re-applied on every call rather than consumed by the
-        # first one: a single export calls get_json() twice -- once to hash the deal
-        # document, once to build the request body -- and consuming them made the two
-        # calls disagree, which both sent the un-edited table and cost a second export.
-        # Reading a table through as_pandas() marks it edited, so an in-place edit to
-        # the frame it returns is covered without re-applying every table. Layer.get_json
-        # resolves this the same way.
-        for table_name in self._custom_table_dirty:
-            table = self._custom_tables.get(table_name)
-            if table is None:
-                continue
-            rows = table.to_records()
-            self._update_custom_table_in_json(result, table_name, rows)
+        self._apply_dirty_tables(result)
 
         # Always apply layer JSON to capture any modifications
         # This ensures that any changes to layers (including limits, premiums, custom fields, etc.)

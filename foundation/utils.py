@@ -206,15 +206,10 @@ def parse_utc_timestamp(value: Any) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
 
-    text = value.strip()
-    # Truncate over-long fractions before handing the string to fromisoformat,
-    # which rejects anything other than 3 or 6 digits.
-    text = re.sub(r"(\.\d{6})\d+", r"\1", text)
-    if text.endswith("Z"):
-        text = f"{text[:-1]}+00:00"
-
     try:
-        parsed = datetime.fromisoformat(text)
+        # fromisoformat reads the trailing Z and truncates the fraction to the
+        # six digits datetime can hold.
+        parsed = datetime.fromisoformat(value.strip())
     except ValueError:
         return None
 
@@ -260,9 +255,7 @@ def parse_datetime_string(value: Any) -> datetime | Any:
         return value
 
     try:
-        # Remove trailing Z if present (UTC indicator)
-        clean_value = value.rstrip("Z")
-        dt = datetime.fromisoformat(clean_value)
+        dt = datetime.fromisoformat(value)
     except (ValueError, AttributeError):
         # If parsing fails, return the original value
         return value

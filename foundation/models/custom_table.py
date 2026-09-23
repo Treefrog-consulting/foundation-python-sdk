@@ -18,6 +18,79 @@ if TYPE_CHECKING:
     from .program import Program
 
 
+def _align_frame(frame: pd.DataFrame, column_names: Sequence[str]) -> pd.DataFrame:
+    """Align columns to match the table definition."""
+    if not column_names:
+        return frame
+
+    if frame.empty:
+        pd = require("pandas", "this table")
+        return pd.DataFrame(columns=column_names)
+
+    return frame.reindex(columns=column_names)
+
+
+def _rows_to_pandas(
+    rows: list[dict[str, Any]] | None, column_names: Sequence[str]
+) -> pd.DataFrame:
+    """Build a DataFrame from raw rows, aligned to the declared columns."""
+    pd = require("pandas", "as_pandas")
+    return _align_frame(pd.DataFrame(rows), column_names)
+
+
+def _frame_to_rows(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    """Convert a DataFrame into list-of-dict records with None for missing values."""
+    if frame.empty:
+        return []
+    pd = require("pandas", "this table")
+    sanitized = frame.where(pd.notna(frame), None)
+    return sanitized.to_dict(orient="records")
+
+
+def _rows_to_polars(
+    rows: list[dict[str, Any]], column_names: Sequence[str]
+) -> pl.DataFrame:
+    """Build a Polars DataFrame from rows, with the declared columns in order.
+
+    Date columns come back as datetimes: a column can hold both date and
+    datetime values, which polars cannot mix.
+
+    Raises:
+        ImportError: If polars is not installed.
+    """
+    pl = require("polars", "as_polars")
+
+    if not rows:
+        if column_names:
+            return pl.DataFrame(schema={c: pl.Null for c in column_names})
+        return pl.DataFrame()
+
+    # datetime is a subclass of date, so compare the exact type.
+    normalized = [
+        {
+            # A date-only cell widened so polars can hold one column
+            # type; naive on purpose, the server stored no time.
+            key: datetime(value.year, value.month, value.day)  # noqa: DTZ001
+            if type(value) is date
+            else value
+            for key, value in row.items()
+        }
+        for row in rows
+    ]
+    frame = pl.DataFrame(normalized, infer_schema_length=None)
+
+    # A column whose valueType the SDK cannot map is absent from the rows
+    # but still declared, so add it back as null rather than raising.
+    if column_names:
+        frame = frame.select(
+            [
+                pl.col(c) if c in frame.columns else pl.lit(None).alias(c)
+                for c in column_names
+            ]
+        )
+    return frame
+
+
 class CustomTable:
     """Wrapper around custom table data with lazy pandas DataFrame support."""
 
@@ -66,10 +139,6 @@ class CustomTable:
         """Truthiness reflects whether the table has any rows."""
         return self.row_count > 0
 
-    def _owner_is_versioned(self) -> bool:
-        """Whether the owning program or layer is a past-version snapshot."""
-        return self._owner.is_versioned
-
     def as_pandas(self) -> pd.DataFrame:
         """
         Return the table as a pandas DataFrame.
@@ -80,16 +149,9 @@ class CustomTable:
         On a program or layer read at a past version there is nothing to edit
         into, so each call returns a fresh copy instead.
         """
-        pd = require("pandas", "as_pandas")
         if self._frame is None:
-            frame = pd.DataFrame(self._rows)
-            if self._column_names:
-                if frame.empty:
-                    frame = pd.DataFrame(columns=self._column_names)
-                else:
-                    frame = frame.reindex(columns=self._column_names)
-            self._frame = frame
-        if self._owner_is_versioned():
+            self._frame = _rows_to_pandas(self._rows, self._column_names)
+        if self._owner.is_versioned:
             return self._frame.copy()
         self._owner._mark_custom_table_modified(self._snake_name)
         return self._frame
@@ -108,42 +170,12 @@ class CustomTable:
         Raises:
             ImportError: If polars is not installed.
         """
-        pl = require("polars", "as_polars")
-
         rows = (
-            self._frame_to_rows(self._frame)
+            _frame_to_rows(self._frame)
             if self._frame is not None
             else (self._rows or [])
         )
-        if not rows:
-            if self._column_names:
-                return pl.DataFrame(schema={c: pl.Null for c in self._column_names})
-            return pl.DataFrame()
-
-        # datetime is a subclass of date, so compare the exact type.
-        normalized = [
-            {
-                # A date-only cell widened so polars can hold one column
-                # type; naive on purpose, the server stored no time.
-                key: datetime(value.year, value.month, value.day)  # noqa: DTZ001
-                if type(value) is date
-                else value
-                for key, value in row.items()
-            }
-            for row in rows
-        ]
-        frame = pl.DataFrame(normalized, infer_schema_length=None)
-
-        # A column whose valueType the SDK cannot map is absent from the rows
-        # but still declared, so add it back as null rather than raising.
-        if self._column_names:
-            frame = frame.select(
-                [
-                    pl.col(c) if c in frame.columns else pl.lit(None).alias(c)
-                    for c in self._column_names
-                ]
-            )
-        return frame
+        return _rows_to_polars(rows, self._column_names)
 
     def set_data(self, value: pd.DataFrame | list[dict[str, Any]]) -> None:
         """
@@ -159,9 +191,9 @@ class CustomTable:
         else:
             frame = pd.DataFrame(value or [])
 
-        frame = self._align_frame(frame)
+        frame = _align_frame(frame, self._column_names)
         self._frame = frame
-        self._rows = self._frame_to_rows(frame)
+        self._rows = _frame_to_rows(frame)
         self._owner._mark_custom_table_modified(self._snake_name)
 
     def load_initial_rows(self, rows: list[dict[str, Any]]) -> None:
@@ -178,44 +210,8 @@ class CustomTable:
     def to_records(self) -> list[dict[str, Any]]:
         """Return table data as a list of dictionaries."""
         if self._frame is not None:
-            self._rows = self._frame_to_rows(self._frame)
+            self._rows = _frame_to_rows(self._frame)
         return copy.deepcopy(self._rows)
-
-    def _align_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
-        """Align columns to match the table definition."""
-        if not self._column_names:
-            return frame
-
-        if frame.empty:
-            pd = require("pandas", "this table")
-            return pd.DataFrame(columns=self._column_names)
-
-        return frame.reindex(columns=self._column_names)
-
-    def _frame_to_rows(self, frame: pd.DataFrame) -> list[dict[str, Any]]:
-        """Convert a DataFrame into list-of-dict records with None for missing values."""
-        if frame.empty:
-            return []
-        pd = require("pandas", "this table")
-        sanitized = frame.where(pd.notna(frame), None)
-        return sanitized.to_dict(orient="records")
-
-    def __dir__(self):
-        """Return list of available attributes for autocomplete."""
-        attrs = set(super().__dir__())
-        attrs.update(
-            [
-                "name",
-                "snake_case_name",
-                "columns",
-                "row_count",
-                "as_pandas",
-                "set_data",
-                "to_records",
-                "describe",
-            ]
-        )
-        return sorted(attrs)
 
     def describe(self) -> None:
         """Display a summary of this custom table.
