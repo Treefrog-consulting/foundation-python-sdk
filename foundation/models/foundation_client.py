@@ -647,6 +647,18 @@ class FoundationClient:
         return self._reference("layout_options")
 
     @property
+    def program_loss_condition_fields(self) -> "ReferenceTable":
+        """The fields a Complex loss filter's conditions can test.
+
+        One row per field: its ID, where its value comes from, what a condition
+        on it compares it with and the reference table its values are picked
+        from. Rows carry ``programLossConditionFieldId`` and ``displayName``
+        rather than ``id`` and ``name``, so ``by_id`` and ``by_name`` are empty;
+        read them from the frame.
+        """
+        return self._reference("program_loss_condition_fields")
+
+    @property
     def sys_configs(self) -> "ReferenceTable":
         """Deal module system configuration entries.
 

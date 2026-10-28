@@ -51,7 +51,7 @@ from .models import (
     Ylt,
 )
 
-__version__ = "0.14.0"
+__version__ = "0.15.1"
 __all__ = [
     "AuthenticationError",
     "ConflictError",

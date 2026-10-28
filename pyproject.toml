@@ -32,8 +32,10 @@ dependencies = [
 # duckdb alone serves the loss-export download and the single-metric lookups
 # (metric_results.get_by_name / get_by_id / get_by_source_name), which read
 # scalars straight out of the export and need no DataFrame library.
+# Below 2.0: DuckDB 2.0 dropped .pl() from execute() results, which every
+# as_polars() over the export calls.
 duckdb = [
-    "duckdb>=1.0.0",
+    "duckdb>=1.0.0,<2",
 ]
 pandas = [
     "foundation-platform-sdk[duckdb]",

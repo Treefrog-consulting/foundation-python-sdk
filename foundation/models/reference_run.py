@@ -155,11 +155,11 @@ class ReferenceRun:
             as_of_date: Optional as-of date for analysis.
             claim_amount: Optional claim amount setting.
             historical_flag: Optional flag to include historical events.
-            distribute_claims: Optional flag to compute secondary uncertainty on claims (Blended/Claims-only analyses).
+            distribute_claims: Optional flag to draw each claim's reserves with secondary uncertainty (Blended/Claims-only analyses).
             event_list: Optional list of specific events to include.
-            claims_history_values: Optional claims history configuration. When
-                distribute_claims is set, each claims row's "Base CoV" entry here
-                drives the secondary uncertainty.
+            claims_history_values: Optional claims history configuration. The
+                platform reads the claims it distributes from the deal, not
+                from here.
 
         Returns:
             RunConfiguration instance ready for loss analysis.

@@ -68,6 +68,7 @@ REFERENCE_TABLES: dict[str, tuple[str, str, type[BaseModel] | None]] = {
     "metrics": (DEAL, "metric", None),
     "participants": (DEAL, "participant", Participant),
     "program_groups": (DEAL, "programGroup", None),
+    "program_loss_condition_fields": (DEAL, "programLossConditionField", None),
     "participant_statuses": (DEAL, "participantStatus", ParticipantStatus),
     "tokens": (DEAL, "token", None),
     "token_module_maps": (DEAL, "tokenModuleMap", None),
